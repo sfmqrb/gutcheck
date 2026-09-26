@@ -5,7 +5,7 @@ use clap::Parser;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use std::collections::HashMap;
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
@@ -18,6 +18,7 @@ const MAX_LEN: usize = 1024;
 const HEAD_MAX_LEN: usize = 256;
 // Repeated lines (logs!) reuse their answer. ponytail: cleared when full, swap for an LRU if it ever thrashes.
 const CACHE_MAX: usize = 50_000;
+const LABEL_COLORS: [&str; 6] = ["1;36", "1;33", "1;31", "1;32", "1;35", "1;34"];
 
 #[derive(Parser)]
 #[command(version, about = "System-1 grep: filter, score or classify stdin lines with a natural-language question, locally.")]
@@ -152,6 +153,9 @@ fn main() -> Result<()> {
         .commit_from_file(&model)?;
 
     // One line per forward pass: batching measured no faster on CPU (compute-bound), and this streams `tail -f`.
+    // Colors only on a terminal (or CLICOLOR_FORCE=1), never when piped; NO_COLOR turns them off.
+    let color = std::env::var_os("NO_COLOR").is_none() && (std::io::stdout().is_terminal() || std::env::var_os("CLICOLOR_FORCE").is_some());
+    let paint = |code: &str, s: String| if color { format!("\x1b[{code}m{s}\x1b[0m") } else { s };
     let mut out = std::io::stdout().lock();
     let mut cache: HashMap<String, Vec<f32>> = HashMap::new();
     let mut matched = false;
@@ -174,12 +178,12 @@ fn main() -> Result<()> {
         };
         let r = if !labels.is_empty() {
             let best = (0..p.len()).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap();
-            writeln!(out, "{}\t{line}", labels[best].0)
+            writeln!(out, "{}\t{line}", paint(LABEL_COLORS[best % LABEL_COLORS.len()], labels[best].0.clone()))
         } else if cli.score {
-            writeln!(out, "{:.2}\t{line}", p[1])
+            writeln!(out, "{}\t{line}", paint(if p[1] >= 0.75 { "1;31" } else if p[1] >= 0.5 { "1;33" } else { "2" }, format!("{:.2}", p[1])))
         } else if (p[1] >= cli.threshold) != cli.invert {
             matched = true;
-            writeln!(out, "{line}")
+            writeln!(out, "{}", paint("32", line.clone()))
         } else { Ok(()) };
         if r.and_then(|_| out.flush()).is_err() { return Ok(()); } // downstream closed (e.g. `| head`)
     }
