@@ -1,117 +1,131 @@
-//! gutcheck: System-1 grep. Ask a question about every line of stdin, answered by a
-//! non-autoregressive decision model (Laya multilingual, ONNX) in one forward pass per batch.
+//! gutcheck: grep for meaning. Ask a question about every line, paragraph, file or diff hunk,
+//! answered locally by a non-autoregressive decision model (Laya) in one forward pass.
+mod input;
+mod model;
+mod output;
+
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use ort::session::{builder::GraphOptimizationLevel, Session};
-use ort::value::Tensor;
-use std::collections::HashMap;
-use std::io::{BufRead, IsTerminal, Read, Write};
-use std::path::{Path, PathBuf};
-use tokenizers::Tokenizer;
-
-// Pinned community ONNX export of convaiinnovations/laya-multilingual (Apache-2.0).
-const REPO: &str = "https://huggingface.co/soyelmismo/laya-multilingual-onnx/resolve/0966c4fa58da6878b39e7e14cb5e93313b82d828";
-const FILES: [(&str, &str); 2] = [("model-fp32.onnx", "model.onnx"), ("tokenizer/tokenizer.json", "tokenizer.json")];
-// From the checkpoint's rl_agent_config.json. Its fitted temperatures are all 1.0, so none are applied.
-// ponytail: hardcoded for this one checkpoint; read rl_agent_config.json if the model becomes swappable.
-const MAX_LEN: usize = 1024;
-const HEAD_MAX_LEN: usize = 256;
-// Repeated lines (logs!) reuse their answer. ponytail: cleared when full, swap for an LRU if it ever thrashes.
-const CACHE_MAX: usize = 50_000;
-const LABEL_COLORS: [&str; 6] = ["1;36", "1;33", "1;31", "1;32", "1;35", "1;34"];
+use ignore::{overrides::OverrideBuilder, WalkBuilder};
+use input::{Mode, Record};
+use model::{template, Model, Question};
+use output::{Printer, Shown};
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(version, about = "System-1 grep: filter, score or classify stdin lines with a natural-language question, locally.")]
+#[command(version, about = "grep for meaning: filter, score or classify text with a plain-English question, locally on CPU.",
+    override_usage = "gutcheck [OPTIONS] <QUESTION> [PATH]...\n       gutcheck [OPTIONS] -e <QUESTION>... [PATH]...")]
 struct Cli {
-    /// The question, e.g. "is this a bug report?"
-    question: Option<String>,
-    /// Print every line prefixed with P(yes) instead of filtering
-    #[arg(short, long)]
-    score: bool,
-    /// Comma-separated labels (optionally `label=description`); print every line prefixed with the best one
-    #[arg(short, long, value_name = "A,B,C")]
-    choice: Option<String>,
-    /// Keep lines whose P(yes) is at least this
-    #[arg(short, long, default_value_t = 0.5)]
-    threshold: f32,
-    /// Keep lines where the answer is no
+    /// The question, then files to read (stdin if none). With -e, every argument is a path.
+    #[arg(value_name = "QUESTION|PATH")]
+    args: Vec<String>,
+
+    /// Another question; a line matches if any fits (all with --all)
+    #[arg(short = 'e', long = "question", value_name = "QUESTION")]
+    more: Vec<String>,
+    /// With several questions, require every one to fit
+    #[arg(long)]
+    all: bool,
+    /// Match when P(yes) is at least this
+    #[arg(short = 'p', long, visible_short_alias = 't', visible_alias = "threshold", default_value_t = 0.5, value_name = "P")]
+    min_prob: f32,
+    /// Keep the lines that do NOT match
     #[arg(short = 'v', long)]
     invert: bool,
+
+    /// Print every record with its P(yes) instead of filtering
+    #[arg(short, long)]
+    score: bool,
+    /// Print every record with the best of these labels, `label` or `label=description`
+    #[arg(short, long, value_name = "A,B,C")]
+    choice: Option<String>,
+    /// One JSON object per printed record
+    #[arg(long)]
+    json: bool,
+
+    /// Judge paragraphs (blank-line separated) instead of lines
+    #[arg(long, conflicts_with_all = ["whole", "diff", "field"])]
+    para: bool,
+    /// Judge each whole file
+    #[arg(long, conflicts_with_all = ["diff", "field"])]
+    whole: bool,
+    /// Judge each hunk of a unified diff (git diff, git log -p)
+    #[arg(long, conflicts_with = "field")]
+    diff: bool,
+    /// Judge one field of each JSON line (`a.b` for nested); prints the whole line
+    #[arg(long, value_name = "NAME")]
+    field: Option<String>,
+
+    /// Search directories recursively (respects .gitignore)
+    #[arg(short, long)]
+    recursive: bool,
+    /// With -r, only files matching this glob; `!glob` excludes. Repeatable
+    #[arg(long, value_name = "GLOB")]
+    glob: Vec<String>,
+    /// With -r, do not read .gitignore
+    #[arg(long)]
+    no_ignore: bool,
+
+    /// Prefix each match with its line number
+    #[arg(short = 'n', long)]
+    line_number: bool,
+    /// Prefix each match with its file name (default with several files)
+    #[arg(short = 'H', long)]
+    with_filename: bool,
+    /// Print only the number of matches per file
+    #[arg(long)]
+    count: bool,
+    /// Print only the names of files with a match, stopping each at its first match
+    #[arg(short = 'l', long)]
+    files_with_matches: bool,
+    /// Print nothing; stop at the first match and exit 0
+    #[arg(short, long)]
+    quiet: bool,
+    /// Stop each file after this many matches
+    #[arg(short = 'm', long, value_name = "NUM")]
+    max_count: Option<usize>,
+
+    /// Treat lines that differ only in numbers, timestamps and ids as one line (one model call per shape; big speedup on logs)
+    #[arg(short, long)]
+    fuzzy: bool,
+    /// Read everything and report how many model calls it would take, without loading the model
+    #[arg(long)]
+    estimate: bool,
+    /// Cap on tokens per record, question included; longer text is cut (lower is faster)
+    #[arg(long, default_value_t = 1024, value_name = "N")]
+    max_tokens: usize,
+    /// CPU threads for the model (default: all)
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    threads: usize,
 }
 
-/// A question the way Laya's `build_sequence` reads it.
-struct Question {
-    qtype: i64, // 0 choice, 1 score, 2 noul
-    head: Vec<u32>,
-    options: Vec<Vec<u32>>, // each starts with the mask token
+enum Src {
+    Stdin,
+    File(PathBuf),
 }
 
-/// `[CLS] <type> question: ins [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] state [SEP]`, returns (ids, marker positions).
-fn build_sequence(q: &Question, state: &[u32], cls: u32, sep: u32, max_len: usize, head_max_len: usize) -> (Vec<u32>, Vec<usize>) {
-    let mut opts = q.options.clone();
-    let mut budget = head_max_len as isize - opts.iter().map(|o| o.len() as isize).sum::<isize>();
-    if budget < 16 {
-        let per = 4.max((head_max_len.saturating_sub(16)) / opts.len().max(1));
-        opts.iter_mut().for_each(|o| o.truncate(per));
-        budget = head_max_len as isize - opts.iter().map(|o| o.len() as isize).sum::<isize>();
-    }
-    let head = &q.head[..q.head.len().min(budget.max(8) as usize)];
-    let mut ids = vec![cls];
-    ids.extend(head);
-    ids.push(sep);
-    let mut markers = vec![];
-    for o in &opts {
-        markers.push(ids.len());
-        ids.extend(o);
-    }
-    ids.push(sep);
-    let room = max_len.saturating_sub(ids.len() + 1);
-    ids.extend(&state[..state.len().min(room)]);
-    ids.push(sep);
-    ids.truncate(max_len);
-    markers.retain(|&m| m < max_len);
-    (ids, markers)
-}
-
-fn softmax(z: &[f32]) -> Vec<f32> {
-    let m = z.iter().cloned().fold(f32::MIN, f32::max);
-    let e: Vec<f32> = z.iter().map(|x| (x - m).exp()).collect();
-    let s: f32 = e.iter().sum();
-    e.iter().map(|x| x / s).collect()
-}
-
-fn model_dir() -> Result<PathBuf> {
-    let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))
-        .context("set XDG_CACHE_HOME or HOME")?;
-    let dir = cache.join("gutcheck").join("laya-multilingual-0966c4f");
-    for (remote, local) in FILES {
-        let dest = dir.join(local);
-        if dest.exists() {
-            continue;
+fn main() {
+    std::process::exit(match run() {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("gutcheck: {e:#}");
+            2
         }
-        std::fs::create_dir_all(&dir)?;
-        eprintln!("gutcheck: first run, downloading {local} to {} ...", dir.display());
-        let tmp = dest.with_extension("part");
-        let resp = ureq::get(&format!("{REPO}/{remote}")).call()?;
-        let total = resp.body().content_length().unwrap_or(0);
-        let mut body = resp.into_body();
-        let (mut r, mut f, mut buf, mut done) = (body.as_reader(), std::fs::File::create(&tmp)?, vec![0u8; 1 << 20], 0u64);
-        loop {
-            let n = r.read(&mut buf)?;
-            if n == 0 { break; }
-            f.write_all(&buf[..n])?;
-            done += n as u64;
-            if total > 0 { eprint!("\r  {:>3}% of {} MB", done * 100 / total, total >> 20); }
-        }
-        eprintln!();
-        std::fs::rename(&tmp, &dest)?;
-    }
-    Ok(dir)
+    });
 }
 
-fn main() -> Result<()> {
+fn run() -> Result<i32> {
     let cli = Cli::parse();
+    let (questions, paths) = if cli.more.is_empty() {
+        match cli.args.split_first() {
+            Some((q, p)) => (vec![q.clone()], p.to_vec()),
+            None => (vec![], vec![]),
+        }
+    } else {
+        (cli.more.clone(), cli.args.clone())
+    };
     // `label` or `label=description`; the model reads "label: description", we print the label.
     let labels: Vec<(String, String)> = cli.choice.iter().flat_map(|c| c.split(',')).map(str::trim).filter(|s| !s.is_empty())
         .map(|s| match s.split_once('=') {
@@ -121,93 +135,171 @@ fn main() -> Result<()> {
     if cli.choice.is_some() && labels.len() < 2 {
         bail!("--choice needs at least two comma-separated labels");
     }
-    let question = match (&cli.question, labels.is_empty()) {
-        (Some(q), _) => q.clone(),
-        (None, false) => "Which category does this text belong to?".into(),
-        (None, true) => bail!("give a question, e.g. gutcheck \"is this a bug report?\""),
+    let questions = match (questions.is_empty(), labels.is_empty()) {
+        (false, _) => questions,
+        (true, false) => vec!["Which category does this text belong to?".into()],
+        (true, true) => bail!("give a question, e.g. gutcheck \"is this a bug report?\" app.log"),
     };
+    let mode = match (&cli.field, cli.para, cli.whole, cli.diff) {
+        (Some(f), ..) => Mode::Field(f.clone()),
+        (_, true, ..) => Mode::Para,
+        (_, _, true, _) => Mode::Whole,
+        (_, _, _, true) => Mode::Diff,
+        _ => Mode::Lines,
+    };
+    let sources = sources(&cli, &paths)?;
 
-    let dir = model_dir()?;
-    let tok = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(anyhow::Error::msg)?;
-    let id = |t: &str| tok.token_to_id(t).with_context(|| format!("tokenizer has no {t}"));
-    let (cls, sep, mask) = (id("<bos>")?, id("<eos>")?, id("<mask>")?);
-    let enc = |s: &str| -> Result<Vec<u32>> {
-        Ok(tok.encode(s.replace("<mask>", " "), false).map_err(anyhow::Error::msg)?.get_ids().to_vec())
-    };
-    let opt = |s: &str| -> Result<Vec<u32>> {
-        let mut o = vec![mask];
-        o.extend(enc(&format!(" {s}"))?.into_iter().take(48));
-        Ok(o)
-    };
-    let q = if labels.is_empty() {
-        Question { qtype: 2, head: enc(&format!("noul question: {question}"))?,
-                   options: vec![opt("false: no, the statement does not hold")?, opt("true: yes, the statement holds")?] }
-    } else {
-        Question { qtype: 0, head: enc(&format!("choice question: {question}"))?,
-                   options: labels.iter().map(|l| opt(&l.1)).collect::<Result<_>>()? }
-    };
-
-    let model = std::env::var_os("GUTCHECK_MODEL").map(PathBuf::from).unwrap_or(dir.join("model.onnx"));
-    let mut session = Session::builder()?
-        .with_optimization_level(GraphOptimizationLevel::Level3).map_err(|e| anyhow::anyhow!("{e}"))?
-        .commit_from_file(&model)?;
-
-    // One line per forward pass: batching measured no faster on CPU (compute-bound), and this streams `tail -f`.
-    // Colors only on a terminal (or CLICOLOR_FORCE=1), never when piped; NO_COLOR turns them off.
-    let color = std::env::var_os("NO_COLOR").is_none() && (std::io::stdout().is_terminal() || std::env::var_os("CLICOLOR_FORCE").is_some());
-    let paint = |code: &str, s: String| if color { format!("\x1b[{code}m{s}\x1b[0m") } else { s };
-    let mut out = std::io::stdout().lock();
-    let mut cache: HashMap<String, Vec<f32>> = HashMap::new();
-    let mut matched = false;
-    for line in std::io::stdin().lock().lines() {
-        let line = line?;
-        let p = if let Some(p) = cache.get(&line) { p.clone() } else {
-            let (ids, markers) = build_sequence(&q, &enc(&line)?, cls, sep, MAX_LEN, HEAD_MAX_LEN);
-            let (len, k) = (ids.len(), markers.len());
-            let outputs = session.run(ort::inputs! {
-                "input_ids" => Tensor::from_array(([1, len], ids.iter().map(|&t| t as i64).collect::<Vec<_>>()))?,
-                "attention_mask" => Tensor::from_array(([1, len], vec![1i64; len]))?,
-                "marker_pos" => Tensor::from_array(([1, k], markers.iter().map(|&m| m as i64).collect::<Vec<_>>()))?,
-                "marker_mask" => Tensor::from_array(([1, k], vec![true; k]))?,
-                "qtype" => Tensor::from_array(([1], vec![q.qtype]))?,
-            })?;
-            let p = softmax(&outputs["logits"].try_extract_tensor::<f32>()?.1[..k]);
-            if cache.len() >= CACHE_MAX { cache.clear(); }
-            cache.insert(line.clone(), p.clone());
-            p
-        };
-        let r = if !labels.is_empty() {
-            let best = (0..p.len()).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap();
-            writeln!(out, "{}\t{line}", paint(LABEL_COLORS[best % LABEL_COLORS.len()], labels[best].0.clone()))
-        } else if cli.score {
-            writeln!(out, "{}\t{line}", paint(if p[1] >= 0.75 { "1;31" } else if p[1] >= 0.5 { "1;33" } else { "2" }, format!("{:.2}", p[1])))
-        } else if (p[1] >= cli.threshold) != cli.invert {
-            matched = true;
-            writeln!(out, "{}", paint("32", line.clone()))
-        } else { Ok(()) };
-        if r.and_then(|_| out.flush()).is_err() { return Ok(()); } // downstream closed (e.g. `| head`)
+    if cli.estimate {
+        return estimate(&sources, &mode, questions.len());
     }
-    // Like grep: in filter mode, exit 1 when nothing matched, so `if gutcheck "..." < f; then` works.
-    if labels.is_empty() && !cli.score && !matched { std::process::exit(1); }
-    Ok(())
+
+    let mut model = Model::load(cli.fuzzy, cli.threads, cli.max_tokens)?;
+    let qs: Vec<Question> = if labels.is_empty() {
+        questions.iter().map(|q| model.yes_no(q)).collect::<Result<_>>()?
+    } else {
+        model.choice(&questions[0], &labels.iter().map(|l| l.1.clone()).collect::<Vec<_>>()).map(|q| vec![q])?
+    };
+    let mut printer = Printer::new();
+    printer.json = cli.json;
+    printer.with_file = cli.with_filename || sources.len() > 1 || matches!(mode, Mode::Diff); // diff hunks carry their own file names
+    printer.line_number = cli.line_number;
+
+    let filtering = labels.is_empty() && !cli.score;
+    let (mut any_match, mut had_error, mut stop) = (false, false, false);
+    for src in &sources {
+        if stop {
+            break;
+        }
+        let (name, reader) = match open(src) {
+            Ok(Some(x)) => x,
+            Ok(None) => continue, // binary
+            Err(e) => {
+                eprintln!("gutcheck: {e:#}");
+                had_error = true;
+                continue;
+            }
+        };
+        let mut in_file = 0usize;
+        let mut handle = |rec: Record| -> Result<bool> {
+            if rec.judge.trim().is_empty() {
+                return Ok(true); // nothing to judge, no model call
+            }
+            let shown_label;
+            let (hit, shown) = if !labels.is_empty() {
+                let p = model.probs(0, &qs[0], &rec.judge)?;
+                let best = (0..p.len()).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap();
+                shown_label = labels[best].0.clone();
+                (true, Shown::Label(best, &shown_label))
+            } else {
+                let mut ps = Vec::with_capacity(qs.len());
+                for (i, q) in qs.iter().enumerate() {
+                    ps.push(model.probs(i, q, &rec.judge)?[1]);
+                }
+                let p = if cli.all { ps.iter().cloned().fold(f32::MAX, f32::min) } else { ps.iter().cloned().fold(f32::MIN, f32::max) };
+                if cli.score { (true, Shown::Score(p)) } else { ((p >= cli.min_prob) != cli.invert, Shown::Plain) }
+            };
+            if !hit {
+                return Ok(true);
+            }
+            in_file += 1;
+            any_match |= filtering;
+            let printed = if cli.quiet {
+                Ok(())
+            } else if cli.files_with_matches {
+                printer.line(&name, true)
+            } else if cli.count {
+                Ok(())
+            } else {
+                printer.record(&rec, shown)
+            };
+            if let Err(e) = printed {
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    stop = true; // downstream closed (e.g. `| head`)
+                    return Ok(false);
+                }
+                return Err(e.into());
+            }
+            if cli.quiet {
+                stop = true;
+            }
+            Ok(!(cli.quiet || cli.files_with_matches || cli.max_count.is_some_and(|m| in_file >= m)))
+        };
+        input::read(reader, &name, &mode, &mut handle)?;
+        if cli.count && !stop {
+            let line = if printer.with_file { format!("{name}:{in_file}") } else { in_file.to_string() };
+            let _ = printer.line(&line, false);
+        }
+    }
+    // Like grep: 0 if something matched, 1 if not, 2 on error. Score and label modes always print, so they exit 0.
+    Ok(if had_error { 2 } else if filtering && !any_match { 1 } else { 0 })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sequence_layout_and_truncation() {
-        let q = Question { qtype: 2, head: vec![10, 11], options: vec![vec![9, 20], vec![9, 21, 22]] };
-        let (ids, m) = build_sequence(&q, &[30, 31, 32], 1, 2, 64, 256);
-        assert_eq!(ids, vec![1, 10, 11, 2, 9, 20, 9, 21, 22, 2, 30, 31, 32, 2]);
-        assert_eq!(m, vec![4, 6]);
-        // state is cut to fit max_len, keeping the trailing [SEP]
-        let (ids, _) = build_sequence(&q, &[30; 100], 1, 2, 16, 256);
-        assert_eq!((ids.len(), *ids.last().unwrap()), (16, 2));
-        // options over the head budget are trimmed evenly to (head_max_len - 16) / n
-        let big = Question { qtype: 0, head: vec![10; 50], options: vec![vec![9; 40]; 3] };
-        let (_, m) = build_sequence(&big, &[], 1, 2, 1024, 64);
-        assert_eq!(m.iter().zip(m.iter().skip(1)).map(|(a, b)| b - a).collect::<Vec<_>>(), vec![16, 16]);
+/// stdin, the files named, or (with -r) every file under the directories named.
+fn sources(cli: &Cli, paths: &[String]) -> Result<Vec<Src>> {
+    if paths.is_empty() && !cli.recursive {
+        return Ok(vec![Src::Stdin]);
     }
+    let mut out = vec![];
+    for p in if paths.is_empty() { vec![".".to_string()] } else { paths.to_vec() } {
+        let path = PathBuf::from(&p);
+        if p == "-" {
+            out.push(Src::Stdin);
+        } else if path.is_dir() {
+            if !cli.recursive {
+                bail!("{p}: is a directory (use -r)");
+            }
+            let mut walk = WalkBuilder::new(&path);
+            walk.git_ignore(!cli.no_ignore).ignore(!cli.no_ignore).sort_by_file_path(|a, b| a.cmp(b));
+            if !cli.glob.is_empty() {
+                let mut globs = OverrideBuilder::new(&path);
+                for g in &cli.glob {
+                    globs.add(g)?;
+                }
+                walk.overrides(globs.build()?);
+            }
+            for entry in walk.build() {
+                let entry = entry?;
+                if entry.file_type().is_some_and(|t| t.is_file()) {
+                    out.push(Src::File(entry.into_path()));
+                }
+            }
+        } else {
+            out.push(Src::File(path));
+        }
+    }
+    Ok(out)
+}
+
+/// A named reader, or None for a binary file (skipped, like ripgrep).
+fn open(src: &Src) -> Result<Option<(String, Box<dyn BufRead>)>> {
+    Ok(match src {
+        Src::Stdin => Some(("-".into(), Box::new(std::io::stdin().lock()))),
+        Src::File(p) => {
+            let name = p.display().to_string();
+            let mut r = BufReader::new(std::fs::File::open(p).with_context(|| name.clone())?);
+            if r.fill_buf()?.iter().take(8192).any(|&b| b == 0) {
+                return Ok(None);
+            }
+            Some((name, Box::new(r)))
+        }
+    })
+}
+
+/// How many model calls the run would take, at the measured ~10 calls/s on a laptop CPU.
+fn estimate(sources: &[Src], mode: &Mode, questions: usize) -> Result<i32> {
+    let (mut total, mut distinct, mut shapes) = (0usize, HashSet::new(), HashSet::new());
+    for src in sources {
+        let Some((name, reader)) = open(src)? else { continue };
+        input::read(reader, &name, mode, &mut |rec| {
+            total += 1;
+            shapes.insert(template(&rec.judge));
+            distinct.insert(rec.judge);
+            Ok(true)
+        })?;
+    }
+    let secs = |n: usize| format!("{:.0} s", (n * questions) as f64 / 10.0);
+    println!("records         {total}");
+    println!("distinct        {:<8} about {}", distinct.len(), secs(distinct.len()));
+    println!("with --fuzzy    {:<8} about {}", shapes.len(), secs(shapes.len()));
+    Ok(0)
 }

@@ -1,6 +1,6 @@
 [package]
 name = "gutcheck"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "System-1 grep: filter, score and classify text streams with a natural-language question, locally"
 license = "MIT"
@@ -14,6 +14,8 @@ clap = { version = "4", features = ["derive"] }
 ort = "=2.0.0-rc.13"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 ureq = "3"
+serde_json = "1"
+ignore = "0.4"
 
 [profile.release]
 lto = "thin"

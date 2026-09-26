@@ -1,0 +1,72 @@
+2026-09-12T10:00:00Z INFO  GET /api/cart 200 52ms user=1791
+2026-09-12T10:00:07Z INFO  GET /search 200 14ms user=6991
+2026-09-12T10:00:14Z INFO  GET /search 200 29ms user=1614
+2026-09-12T10:00:21Z INFO  GET /api/orders 200 10ms user=4943
+2026-09-12T10:00:28Z INFO  GET /api/orders 200 9ms user=3028
+2026-09-12T10:00:35Z WARN  slow query took 3383ms on table orders
+2026-09-12T10:01:42Z INFO  session a90d9df2d60f refreshed for user=7499
+2026-09-12T10:01:49Z INFO  GET /api/cart 200 7ms user=3181
+2026-09-12T10:01:56Z INFO  GET /api/cart 200 71ms user=2929
+2026-09-12T10:01:03Z INFO  GET /search 200 89ms user=3961
+2026-09-12T10:01:10Z INFO  GET /search 200 83ms user=4078
+2026-09-12T10:01:17Z INFO  GET /search 200 10ms user=1976
+2026-09-12T10:02:24Z INFO  GET /api/orders 200 89ms user=9711
+2026-09-12T10:02:31Z INFO  GET /health 200 61ms user=8424
+2026-09-12T10:02:38Z INFO  GET /api/cart 200 25ms user=4999
+2026-09-12T10:02:45Z INFO  GET /health 200 69ms user=9111
+2026-09-12T10:02:52Z ERROR upstream timeout after 28s calling payments (request 3acce672b649)
+2026-09-12T10:02:59Z INFO  GET /api/items 200 17ms user=9387
+2026-09-12T10:03:06Z INFO  GET /health 200 21ms user=9011
+2026-09-12T10:03:13Z INFO  GET /api/items 200 73ms user=6140
+2026-09-12T10:03:20Z INFO  GET /health 200 78ms user=9137
+2026-09-12T10:03:27Z INFO  GET /api/orders 200 10ms user=2533
+2026-09-12T10:03:34Z WARN  slow query took 2741ms on table orders
+2026-09-12T10:03:41Z INFO  session b2d6a310880f refreshed for user=6072
+2026-09-12T10:04:48Z INFO  session 0b893bfe65ae refreshed for user=8301
+2026-09-12T10:04:55Z INFO  GET /api/orders 200 87ms user=6685
+2026-09-12T10:04:02Z INFO  GET /api/orders 200 47ms user=3753
+2026-09-12T10:04:09Z INFO  GET /api/orders 200 9ms user=4575
+2026-09-12T10:04:16Z INFO  session cf701c2105bd refreshed for user=5056
+2026-09-12T10:04:23Z INFO  GET /api/orders 200 12ms user=3725
+2026-09-12T10:05:30Z INFO  GET /search 200 37ms user=3243
+2026-09-12T10:05:37Z ERROR upstream timeout after 22s calling payments (request 4d9a4647d6b4)
+2026-09-12T10:05:44Z INFO  GET /health 200 89ms user=7233
+2026-09-12T10:05:51Z WARN  slow query took 1418ms on table orders
+2026-09-12T10:05:58Z INFO  GET /api/cart 200 31ms user=4822
+2026-09-12T10:05:05Z INFO  GET /search 200 25ms user=5304
+2026-09-12T10:06:12Z INFO  GET /api/cart 200 55ms user=9758
+2026-09-12T10:06:19Z INFO  GET /search 200 42ms user=3056
+2026-09-12T10:06:26Z INFO  session 163ff78341f3 refreshed for user=1884
+2026-09-12T10:06:33Z INFO  GET /search 200 52ms user=7521
+2026-09-12T10:06:40Z INFO  GET /api/items 200 63ms user=7560
+2026-09-12T10:06:47Z INFO  GET /api/items 200 28ms user=8219
+2026-09-12T10:07:54Z INFO  GET /health 200 78ms user=1861
+2026-09-12T10:07:01Z INFO  GET /search 200 21ms user=9791
+2026-09-12T10:07:08Z INFO  GET /health 200 80ms user=1417
+2026-09-12T10:07:15Z INFO  GET /api/cart 200 80ms user=7164
+2026-09-12T10:07:22Z INFO  GET /health 200 46ms user=6966
+2026-09-12T10:07:29Z INFO  GET /api/items 200 64ms user=8634
+2026-09-12T10:08:36Z INFO  GET /health 200 12ms user=3361
+2026-09-12T10:08:43Z INFO  GET /health 200 35ms user=8841
+2026-09-12T10:08:50Z ERROR upstream timeout after 10s calling payments (request c27f2e84e905)
+2026-09-12T10:08:57Z INFO  GET /search 200 48ms user=3401
+2026-09-12T10:08:04Z INFO  session 437505eaec06 refreshed for user=9652
+2026-09-12T10:08:11Z INFO  GET /api/items 200 35ms user=9493
+2026-09-12T10:09:18Z INFO  GET /api/cart 200 47ms user=4650
+2026-09-12T10:09:25Z INFO  GET /search 200 44ms user=4654
+2026-09-12T10:09:32Z INFO  GET /api/cart 200 32ms user=7564
+2026-09-12T10:09:39Z INFO  session 65990b3a2d33 refreshed for user=9480
+2026-09-12T10:09:46Z INFO  GET /api/items 200 5ms user=5577
+2026-09-12T10:09:53Z INFO  GET /api/cart 200 90ms user=6640
+2026-09-12T10:10:00Z INFO  GET /health 200 48ms user=2319
+2026-09-12T10:10:07Z INFO  GET /api/cart 200 62ms user=4222
+2026-09-12T10:10:14Z INFO  GET /api/orders 200 81ms user=1031
+2026-09-12T10:10:21Z INFO  GET /health 200 84ms user=2389
+2026-09-12T10:10:28Z ERROR upstream timeout after 8s calling payments (request 8927e7e87763)
+2026-09-12T10:10:35Z INFO  session 923409c00633 refreshed for user=8832
+2026-09-12T10:11:42Z ERROR upstream timeout after 18s calling payments (request 9fc704cac6a2)
+2026-09-12T10:11:49Z INFO  GET /api/orders 200 61ms user=7576
+2026-09-12T10:11:56Z INFO  session 8f44bd158cb9 refreshed for user=3602
+2026-09-12T10:11:03Z INFO  GET /api/cart 200 5ms user=3476
+2026-09-12T10:11:10Z INFO  GET /api/orders 200 85ms user=3394
+2026-09-12T10:11:17Z INFO  GET /search 200 62ms user=6741

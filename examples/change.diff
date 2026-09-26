@@ -1,0 +1,27 @@
+diff --git a/src/auth.rs b/src/auth.rs
+--- a/src/auth.rs
++++ b/src/auth.rs
+@@ -12,7 +12,6 @@ fn login(user: &str, pw: &str) -> Result<Session> {
+     let account = db.find(user)?;
+-    if !account.verify_password(pw) {
+-        return Err(Error::Unauthorized);
+-    }
++    // TODO: password check moved to middleware
+     Ok(Session::new(account))
+ }
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,3 @@
+-# My App
++# My App (beta)
+ Run it with `cargo run`.
+diff --git a/src/cache.rs b/src/cache.rs
+--- a/src/cache.rs
++++ b/src/cache.rs
+@@ -40,6 +40,8 @@ impl Cache {
+     pub fn get(&self, key: &str) -> Option<&Value> {
++        // never expire entries: the sweeper was removed
++        self.entries.get(key)
+-        self.entries.get(key).filter(|e| !e.expired())
+     }

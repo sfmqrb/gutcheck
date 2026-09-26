@@ -13,3 +13,7 @@ gutcheck is an independent project, not affiliated with or endorsed by Convai In
 - Jev, TypeSafe's hosted "System One" service, popularised typed decision models. See also [Kev](https://github.com/jaredpalmer/kev) and [SemIf](https://github.com/TheoLeeCJ/SemIf-OpenJev) for other open takes.
 
 gutcheck's code is MIT (see `LICENSE`). Apache-2.0 model weights are fetched separately at runtime, so the licenses do not conflict.
+
+## Code map
+
+Four small files in `src/`: `model.rs` (download, prompt layout, scoring, cache), `input.rs` (lines, paragraphs, JSON fields, diff hunks), `output.rs` (plain, scored, labelled, JSON, colors) and `main.rs` (options, files, grep flags, exit codes).
