@@ -1,0 +1,12 @@
+App crashes when I click Save on an empty document
+Would love a dark mode option in settings
+Login button does nothing on Firefox 131
+How do I export my data to CSV?
+Memory usage grows to 8GB after an hour and then the tab freezes
+Please add keyboard shortcuts for switching tabs
+Typo in the onboarding screen: "recieve"
+Can you support SSO with Okta?
+Uploading a file larger than 2MB returns a 500 error
+Thanks for the great project, it saved me hours!
+Search results are empty when the query contains an apostrophe
+Feature request: allow exporting charts as SVG

@@ -1,0 +1,12 @@
+a1f3c2e fix typo in README
+b7d9e01 bump lodash from 4.17.20 to 4.17.21
+c4e8a77 rewrite auth token validation and session handling
+d2b6f19 add unit tests for date parser
+e9c1a3b drop users.email unique index and migrate existing rows
+f0a7d4c update CI badge
+1b3e5f8 disable TLS certificate verification for internal API client
+2c8d0a9 refactor: rename variables in utils
+3f6b2e1 change payment rounding from floor to round-half-even
+4a0c9d7 docs: clarify install steps
+5e2f8b3 remove rate limiting from login endpoint
+6d1a7c4 format code with prettier

@@ -1,0 +1,10 @@
+2026-09-12T09:14:02Z INFO  server listening on :8080
+2026-09-12T09:14:05Z INFO  GET /health 200 1ms
+2026-09-12T09:15:11Z ERROR db: connection refused (retrying in 5s)
+2026-09-12T09:15:16Z WARN  cache miss rate above 40% for 10m
+2026-09-12T09:15:20Z INFO  GET /api/items 200 12ms
+2026-09-12T09:16:42Z ERROR payment worker panicked: index out of range
+2026-09-12T09:17:00Z INFO  cron: nightly cleanup finished in 3.2s
+2026-09-12T09:17:30Z WARN  disk usage at 85% on /var/data
+2026-09-12T09:18:03Z INFO  user signed in
+2026-09-12T09:18:44Z WARN  deprecated config key "timeout_ms", use "timeout"

@@ -1,0 +1,20 @@
+[package]
+name = "gutcheck"
+version = "0.1.0"
+edition = "2021"
+description = "System-1 grep: filter, score and classify text streams with a natural-language question, locally"
+license = "MIT"
+repository = "https://github.com/sfmqrb/gutcheck"
+keywords = ["grep", "cli", "classification", "onnx", "laya"]
+categories = ["command-line-utilities", "text-processing"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ort = "=2.0.0-rc.13"
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+ureq = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
