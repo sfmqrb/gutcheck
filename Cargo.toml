@@ -1,6 +1,6 @@
 [package]
 name = "gutcheck"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "System-1 grep: filter, score and classify text streams with a natural-language question, locally"
 license = "MIT"

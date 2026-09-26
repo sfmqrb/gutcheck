@@ -30,6 +30,8 @@ pub struct Model {
     max_len: usize,
     fuzzy: bool,
     cache: HashMap<(usize, String), Vec<f32>>,
+    /// Real forward passes so far; the rest were answered from the cache.
+    pub calls: usize,
 }
 
 impl Model {
@@ -45,7 +47,7 @@ impl Model {
         if threads > 0 {
             builder = builder.with_intra_threads(threads).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
-        Ok(Self { session: builder.commit_from_file(&path)?, tok, special, max_len, fuzzy, cache: HashMap::new() })
+        Ok(Self { session: builder.commit_from_file(&path)?, tok, special, max_len, fuzzy, cache: HashMap::new(), calls: 0 })
     }
 
     fn enc(&self, s: &str) -> Result<Vec<u32>> {
@@ -90,6 +92,7 @@ impl Model {
             "marker_mask" => Tensor::from_array(([1, k], vec![true; k]))?,
             "qtype" => Tensor::from_array(([1], vec![q.qtype]))?,
         })?;
+        self.calls += 1;
         let p = softmax(&outputs["logits"].try_extract_tensor::<f32>()?.1[..k]);
         if self.cache.len() >= CACHE_MAX {
             self.cache.clear();

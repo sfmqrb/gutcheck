@@ -11,7 +11,8 @@ use input::{Mode, Record};
 use model::{template, Model, Question};
 use output::{Printer, Shown};
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, IsTerminal};
+use std::time::Instant;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -41,6 +42,15 @@ struct Cli {
     /// Print every record with the best of these labels, `label` or `label=description`
     #[arg(short, long, value_name = "A,B,C")]
     choice: Option<String>,
+    /// Print every record ranked by P(yes), best first
+    #[arg(long)]
+    rank: bool,
+    /// Like --rank, but only the best N
+    #[arg(long, value_name = "N")]
+    top: Option<usize>,
+    /// With -c: a histogram of the labels instead of every record
+    #[arg(long, requires = "choice")]
+    tally: bool,
     /// One JSON object per printed record
     #[arg(long)]
     json: bool,
@@ -153,7 +163,15 @@ fn run() -> Result<i32> {
         return estimate(&sources, &mode, questions.len());
     }
 
+    let started = Instant::now();
+    let tty = std::io::stderr().is_terminal() && !cli.quiet;
+    if tty {
+        eprint!("\x1b[2m  loading model...\x1b[0m");
+    }
     let mut model = Model::load(cli.fuzzy, cli.threads, cli.max_tokens)?;
+    if tty {
+        eprint!("\r\x1b[K");
+    }
     let qs: Vec<Question> = if labels.is_empty() {
         questions.iter().map(|q| model.yes_no(q)).collect::<Result<_>>()?
     } else {
@@ -164,7 +182,11 @@ fn run() -> Result<i32> {
     printer.with_file = cli.with_filename || sources.len() > 1 || matches!(mode, Mode::Diff); // diff hunks carry their own file names
     printer.line_number = cli.line_number;
 
-    let filtering = labels.is_empty() && !cli.score;
+    let rank = cli.rank || cli.top.is_some();
+    let filtering = labels.is_empty() && !cli.score && !rank;
+    let mut ranked: Vec<(f32, Record)> = vec![];
+    let mut tally = vec![0usize; labels.len()];
+    let (mut judged, mut printed_total) = (0usize, 0usize);
     let (mut any_match, mut had_error, mut stop) = (false, false, false);
     for src in &sources {
         if stop {
@@ -184,11 +206,13 @@ fn run() -> Result<i32> {
             if rec.judge.trim().is_empty() {
                 return Ok(true); // nothing to judge, no model call
             }
+            judged += 1;
             let shown_label;
             let (hit, shown) = if !labels.is_empty() {
                 let p = model.probs(0, &qs[0], &rec.judge)?;
                 let best = (0..p.len()).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap();
                 shown_label = labels[best].0.clone();
+                tally[best] += 1;
                 (true, Shown::Label(best, &shown_label))
             } else {
                 let mut ps = Vec::with_capacity(qs.len());
@@ -196,18 +220,25 @@ fn run() -> Result<i32> {
                     ps.push(model.probs(i, q, &rec.judge)?[1]);
                 }
                 let p = if cli.all { ps.iter().cloned().fold(f32::MAX, f32::min) } else { ps.iter().cloned().fold(f32::MIN, f32::max) };
-                if cli.score { (true, Shown::Score(p)) } else { ((p >= cli.min_prob) != cli.invert, Shown::Plain) }
+                if cli.score || rank { (true, Shown::Score(p)) } else { ((p >= cli.min_prob) != cli.invert, Shown::Plain) }
             };
             if !hit {
                 return Ok(true);
             }
             in_file += 1;
             any_match |= filtering;
+            printed_total += 1;
+            if rank {
+                if let Shown::Score(p) = shown {
+                    ranked.push((p, rec));
+                }
+                return Ok(true);
+            }
             let printed = if cli.quiet {
                 Ok(())
             } else if cli.files_with_matches {
                 printer.line(&name, true)
-            } else if cli.count {
+            } else if cli.count || cli.tally {
                 Ok(())
             } else {
                 printer.record(&rec, shown)
@@ -229,6 +260,24 @@ fn run() -> Result<i32> {
             let line = if printer.with_file { format!("{name}:{in_file}") } else { in_file.to_string() };
             let _ = printer.line(&line, false);
         }
+    }
+    if rank {
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (p, rec) in ranked.iter().take(cli.top.unwrap_or(usize::MAX)) {
+            if printer.record(rec, Shown::Score(*p)).is_err() {
+                break;
+            }
+        }
+    }
+    if cli.tally {
+        let rows: Vec<(String, usize)> = labels.iter().map(|l| l.0.clone()).zip(tally).collect();
+        let _ = printer.tally(&rows);
+    }
+    if tty && !cli.json {
+        let asked = judged * qs.len();
+        let reused = if asked > model.calls { format!(" ({} reused)", asked - model.calls) } else { String::new() };
+        let head = if filtering { format!("{printed_total} of {judged} matched") } else { format!("{judged} records") };
+        eprintln!("\x1b[2m  {head} · {} model calls{reused} · {:.1} s\x1b[0m", model.calls, started.elapsed().as_secs_f32());
     }
     // Like grep: 0 if something matched, 1 if not, 2 on error. Score and label modes always print, so they exit 0.
     Ok(if had_error { 2 } else if filtering && !any_match { 1 } else { 0 })

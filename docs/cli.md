@@ -25,7 +25,8 @@ The first argument is the question; the rest are files (stdin if there are none,
 | `-e Q` | Another question. A line matches if any question fits, or all with `--all`. |
 | `-p P` (`-t`) | Match when P(yes) is at least `P`. Default 0.5. |
 | `-v` | Keep the lines that do not match. |
-| `-s` | Print every record with its P(yes), colored by heat. |
+| `-s` | Print every record with its P(yes), with a heat bar on a terminal. |
+| `--rank`, `--top N` | Print records ranked by P(yes), best first; `--top` keeps the best `N`. |
 | `-c A,B,C` | Print every record with the best label. `label=description` sharpens a label. |
 
 ## What to print
@@ -37,7 +38,10 @@ The first argument is the question; the rest are files (stdin if there are none,
 | `-l` | Only names of files with a match, stopping each file at its first match. |
 | `-q` | Print nothing, stop at the first match. |
 | `-m N` | Stop each file after `N` matches. |
+| `--tally` | With `-c`: a histogram of the labels instead of every record. |
 | `--json` | One JSON object per printed record: `file`, `line`, `text`, plus `p` or `label`. |
+
+On a terminal, a run ends with a receipt on stderr: `72 records · 8 model calls (64 reused) · 4.4 s`. Pipes get plain text, no colors and no receipt.
 
 ## Speed
 
@@ -45,7 +49,7 @@ The first argument is the question; the rest are files (stdin if there are none,
 |---|---|
 | `-f`, `--fuzzy` | Lines that differ only in numbers, timestamps and ids are answered once. See [benchmarks](benchmarks.md). |
 | `--estimate` | Read the input and report how many model calls it needs, with and without `--fuzzy`. Does not load the model. |
-| `--max-tokens N`, `--threads N` | Cap tokens per record; CPU threads. Neither changed speed in our tests. |
+| `--max-tokens N`, `--threads N` | Cap tokens per record; CPU threads. |
 
 Identical lines are always answered once, and empty records are skipped without a model call.
 
