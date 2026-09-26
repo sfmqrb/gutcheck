@@ -4,7 +4,8 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
-use std::io::{BufRead, Write};
+use std::collections::HashMap;
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
@@ -15,6 +16,8 @@ const FILES: [(&str, &str); 2] = [("model-fp32.onnx", "model.onnx"), ("tokenizer
 // ponytail: hardcoded for this one checkpoint; read rl_agent_config.json if the model becomes swappable.
 const MAX_LEN: usize = 1024;
 const HEAD_MAX_LEN: usize = 256;
+// Repeated lines (logs!) reuse their answer. ponytail: cleared when full, swap for an LRU if it ever thrashes.
+const CACHE_MAX: usize = 50_000;
 
 #[derive(Parser)]
 #[command(version, about = "System-1 grep: filter, score or classify stdin lines with a natural-language question, locally.")]
@@ -89,8 +92,18 @@ fn model_dir() -> Result<PathBuf> {
         std::fs::create_dir_all(&dir)?;
         eprintln!("gutcheck: first run, downloading {local} to {} ...", dir.display());
         let tmp = dest.with_extension("part");
-        let mut body = ureq::get(&format!("{REPO}/{remote}")).call()?.into_body();
-        std::io::copy(&mut body.as_reader(), &mut std::fs::File::create(&tmp)?)?;
+        let resp = ureq::get(&format!("{REPO}/{remote}")).call()?;
+        let total = resp.body().content_length().unwrap_or(0);
+        let mut body = resp.into_body();
+        let (mut r, mut f, mut buf, mut done) = (body.as_reader(), std::fs::File::create(&tmp)?, vec![0u8; 1 << 20], 0u64);
+        loop {
+            let n = r.read(&mut buf)?;
+            if n == 0 { break; }
+            f.write_all(&buf[..n])?;
+            done += n as u64;
+            if total > 0 { eprint!("\r  {:>3}% of {} MB", done * 100 / total, total >> 20); }
+        }
+        eprintln!();
         std::fs::rename(&tmp, &dest)?;
     }
     Ok(dir)
@@ -140,28 +153,38 @@ fn main() -> Result<()> {
 
     // One line per forward pass: batching measured no faster on CPU (compute-bound), and this streams `tail -f`.
     let mut out = std::io::stdout().lock();
+    let mut cache: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut matched = false;
     for line in std::io::stdin().lock().lines() {
         let line = line?;
-        let (ids, markers) = build_sequence(&q, &enc(&line)?, cls, sep, MAX_LEN, HEAD_MAX_LEN);
-        let (len, k) = (ids.len(), markers.len());
-        let outputs = session.run(ort::inputs! {
-            "input_ids" => Tensor::from_array(([1, len], ids.iter().map(|&t| t as i64).collect::<Vec<_>>()))?,
-            "attention_mask" => Tensor::from_array(([1, len], vec![1i64; len]))?,
-            "marker_pos" => Tensor::from_array(([1, k], markers.iter().map(|&m| m as i64).collect::<Vec<_>>()))?,
-            "marker_mask" => Tensor::from_array(([1, k], vec![true; k]))?,
-            "qtype" => Tensor::from_array(([1], vec![q.qtype]))?,
-        })?;
-        let p = softmax(&outputs["logits"].try_extract_tensor::<f32>()?.1[..k]);
+        let p = if let Some(p) = cache.get(&line) { p.clone() } else {
+            let (ids, markers) = build_sequence(&q, &enc(&line)?, cls, sep, MAX_LEN, HEAD_MAX_LEN);
+            let (len, k) = (ids.len(), markers.len());
+            let outputs = session.run(ort::inputs! {
+                "input_ids" => Tensor::from_array(([1, len], ids.iter().map(|&t| t as i64).collect::<Vec<_>>()))?,
+                "attention_mask" => Tensor::from_array(([1, len], vec![1i64; len]))?,
+                "marker_pos" => Tensor::from_array(([1, k], markers.iter().map(|&m| m as i64).collect::<Vec<_>>()))?,
+                "marker_mask" => Tensor::from_array(([1, k], vec![true; k]))?,
+                "qtype" => Tensor::from_array(([1], vec![q.qtype]))?,
+            })?;
+            let p = softmax(&outputs["logits"].try_extract_tensor::<f32>()?.1[..k]);
+            if cache.len() >= CACHE_MAX { cache.clear(); }
+            cache.insert(line.clone(), p.clone());
+            p
+        };
         let r = if !labels.is_empty() {
-            let best = (0..k).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap();
+            let best = (0..p.len()).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap();
             writeln!(out, "{}\t{line}", labels[best].0)
         } else if cli.score {
             writeln!(out, "{:.2}\t{line}", p[1])
         } else if (p[1] >= cli.threshold) != cli.invert {
+            matched = true;
             writeln!(out, "{line}")
         } else { Ok(()) };
         if r.and_then(|_| out.flush()).is_err() { return Ok(()); } // downstream closed (e.g. `| head`)
     }
+    // Like grep: in filter mode, exit 1 when nothing matched, so `if gutcheck "..." < f; then` works.
+    if labels.is_empty() && !cli.score && !matched { std::process::exit(1); }
     Ok(())
 }
 

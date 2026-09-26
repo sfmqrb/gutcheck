@@ -8,7 +8,7 @@
 cargo install --git https://github.com/sfmqrb/gutcheck
 ```
 
-Prebuilt binaries are attached to each GitHub release. The first run downloads a 1.3 GB model to `$XDG_CACHE_HOME/gutcheck`.
+Or grab a prebuilt Linux x86_64 / macOS arm64 binary from the [releases page](https://github.com/sfmqrb/gutcheck/releases). The first run downloads a 1.3 GB model to `$XDG_CACHE_HOME/gutcheck` (with a progress readout) and never needs the network again.
 
 ## Examples
 
@@ -29,7 +29,7 @@ tail -f app.log | gutcheck -v -t 0.7 "is this routine noise?"
 gutcheck -c bug,billing,question,praise "what is this message about?" < examples/support.txt
 ```
 
-Output is one line per input line, in order, streamed (so `tail -f` and `| head` work). `-s` prints `P(yes)<TAB>line`, `-c` prints `label<TAB>line`, and no flag filters (exit 0 always, unlike grep).
+Output is one line per input line, in order, streamed (so `tail -f` and `| head` work). `-s` prints `P(yes)<TAB>line`, `-c` prints `label<TAB>line`, and no flag filters. Like grep, filter mode exits 1 when nothing matched, so `if gutcheck "is this urgent?" < msg.txt; then ...` works. Identical lines are answered once and remembered, so repetitive logs are much faster than the table below.
 
 ## How it works
 
@@ -51,7 +51,7 @@ That is "interactive", not "milliseconds": the millisecond figures Laya publishe
 
 ## Honest limits
 
-- Zero-shot accuracy is modest. Laya's authors recommend fine-tuning for real workloads. Check it on your data before trusting it: on the demo files it misses some obvious cases (for example it rates "disable TLS certificate verification" as low risk).
+- Zero-shot accuracy is modest. Laya's authors recommend fine-tuning for real workloads. Check it on your data before trusting it, and use `-s` to see the scores rather than trusting the 0.5 cut-off (a borderline bug report can score 0.49): on the demo files it misses some obvious cases (for example it rates "disable TLS certificate verification" as low risk).
 - Phrasing matters. Try a second wording if a question misbehaves. `-c` with `label=description` helps.
 - Lines only: one line is one record. Lines beyond 1,024 tokens are truncated.
 
