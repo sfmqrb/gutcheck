@@ -1,0 +1,18 @@
+pkgbase = gutcheck-bin
+	pkgdesc = System-1 grep: filter, score and classify text streams with a natural-language question, locally
+	pkgver = 0.4.0
+	pkgrel = 1
+	url = https://github.com/sfmqrb/gutcheck
+	arch = x86_64
+	license = MIT
+	provides = gutcheck
+	conflicts = gutcheck
+	noextract = gutcheck-v0.4.0-x86_64.tar.gz
+	options = !strip
+	options = !debug
+	source = gutcheck-v0.4.0-x86_64.tar.gz::https://github.com/sfmqrb/gutcheck/releases/download/v0.4.0/gutcheck-v0.4.0-x86_64-unknown-linux-gnu.tar.gz
+	source = LICENSE-0.4.0::https://raw.githubusercontent.com/sfmqrb/gutcheck/v0.4.0/LICENSE
+	sha256sums = 372857917f9513c22aa19469ae3ea8c0ddfeeba5de7f159d6030856b31fef5db
+	sha256sums = 8ccd22b609de6f7fc1fa389310119fbd46a36ecbbd773938d155aa3961ff03bc
+
+pkgname = gutcheck-bin

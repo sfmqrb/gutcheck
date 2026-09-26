@@ -1,0 +1,23 @@
+# Maintainer: sfmqrb <45316558+sfmqrb@users.noreply.github.com>
+pkgname=gutcheck-bin
+_name=gutcheck
+pkgver=0.4.0
+pkgrel=1
+pkgdesc='System-1 grep: filter, score and classify text streams with a natural-language question, locally'
+arch=('x86_64')
+url='https://github.com/sfmqrb/gutcheck'
+license=('MIT')
+provides=('gutcheck')
+conflicts=('gutcheck')
+options=('!strip' '!debug')
+source=("$_name-v$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/$_name-v$pkgver-x86_64-unknown-linux-gnu.tar.gz"
+        "LICENSE-$pkgver::https://raw.githubusercontent.com/sfmqrb/gutcheck/v$pkgver/LICENSE")
+noextract=("$_name-v$pkgver-x86_64.tar.gz")
+sha256sums=('372857917f9513c22aa19469ae3ea8c0ddfeeba5de7f159d6030856b31fef5db'
+            '8ccd22b609de6f7fc1fa389310119fbd46a36ecbbd773938d155aa3961ff03bc')
+
+package() {
+  bsdtar -xf "$_name-v$pkgver-x86_64.tar.gz" -C "$srcdir" gutcheck
+  install -Dm755 gutcheck "$pkgdir/usr/bin/gutcheck"
+  install -Dm644 "LICENSE-$pkgver" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

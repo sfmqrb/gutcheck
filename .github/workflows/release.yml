@@ -21,3 +21,12 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: gutcheck-*.tar.gz
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - run: gh release download ${{ github.ref_name }} -R ${{ github.repository }} -p '*.tar.gz'
+      - run: sha256sum *.tar.gz > SHA256SUMS
+      - run: gh release upload ${{ github.ref_name }} SHA256SUMS -R ${{ github.repository }} --clobber
