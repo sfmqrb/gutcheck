@@ -1,12 +1,15 @@
 [package]
 name = "gutcheck"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "System-1 grep: filter, score and classify text streams with a natural-language question, locally"
 license = "MIT"
 repository = "https://github.com/sfmqrb/gutcheck"
 keywords = ["grep", "cli", "classification", "onnx", "laya"]
 categories = ["command-line-utilities", "text-processing"]
+readme = "README.md"
+homepage = "https://github.com/sfmqrb/gutcheck"
+exclude = ["demo/", "bench/", "examples/", "docs/", "LAUNCH.md", ".github/", "packaging/", "install.sh"]
 
 [dependencies]
 anyhow = "1"
@@ -16,7 +19,19 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 ureq = "3"
 serde_json = "1"
 ignore = "0.4"
+csv = "1"
+clap_complete = "4"
+clap_mangen = "0.2"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.13", features = ["coreml"] }
 
 [profile.release]
 lto = "thin"
 strip = true
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"

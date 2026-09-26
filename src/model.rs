@@ -3,16 +3,57 @@ use anyhow::{Context, Result};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
-// Pinned community ONNX export of convaiinnovations/laya-multilingual (Apache-2.0).
-const REPO: &str = "https://huggingface.co/soyelmismo/laya-multilingual-onnx/resolve/0966c4fa58da6878b39e7e14cb5e93313b82d828";
-const FILES: [(&str, &str); 2] = [("model-fp32.onnx", "model.onnx"), ("tokenizer/tokenizer.json", "tokenizer.json")];
-// From the checkpoint's rl_agent_config.json. Its fitted temperatures are all 1.0, so none are applied.
-// ponytail: hardcoded for this one checkpoint; read rl_agent_config.json if the model becomes swappable.
-const HEAD_MAX_LEN: usize = 256;
+/// The checkpoints gutcheck can run. All are Apache-2.0 Laya models exported to ONNX by the community, pinned to one revision.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Variant {
+    /// mmBERT-base, 322M parameters, 100+ languages, the fastest (default)
+    Multilingual,
+    /// ModernBERT-large, 421M parameters, English, about 2x slower
+    English,
+    /// ModernBERT-large fine-tuned on incidents, support tickets, invoices and agent traces
+    Typed,
+}
+
+struct Spec {
+    dir: &'static str,
+    onnx: &'static str,      // path of the graph in the remote repo
+    tokenizer: &'static str, // path of tokenizer.json in the remote repo
+    repo: &'static str,
+    special: [&'static str; 3], // cls, sep, mask
+    max_len: usize,
+    head_max_len: usize,
+}
+
+const ONNX_MULTI: &str = "https://huggingface.co/soyelmismo/laya-multilingual-onnx/resolve/0966c4fa58da6878b39e7e14cb5e93313b82d828";
+const ONNX_EN: &str = "https://huggingface.co/mariojcr/laya-onnx/resolve/aeebb05497cc473360caf4de1653107cf08d6b10";
+
+impl Variant {
+    fn spec(self) -> Spec {
+        // max_len and head_max_len come from each checkpoint's rl_agent_config.json.
+        match self {
+            Variant::Multilingual => Spec { dir: "laya-multilingual-0966c4f", onnx: "model-fp32.onnx", tokenizer: "tokenizer/tokenizer.json", repo: ONNX_MULTI, special: ["<bos>", "<eos>", "<mask>"], max_len: 1024, head_max_len: 256 },
+            Variant::English => Spec { dir: "laya-english-aeebb05", onnx: "english/laya.onnx", tokenizer: "english/tokenizer.json", repo: ONNX_EN, special: ["[CLS]", "[SEP]", "[MASK]"], max_len: 512, head_max_len: 192 },
+            Variant::Typed => Spec { dir: "laya-typed-aeebb05", onnx: "typed-decisions/laya-typed-decisions.onnx", tokenizer: "typed-decisions/tokenizer.json", repo: ONNX_EN, special: ["[CLS]", "[SEP]", "[MASK]"], max_len: 1024, head_max_len: 256 },
+        }
+    }
+
+    /// Fitted calibration temperature (logits are divided by it); the multilingual checkpoint's are all 1.0.
+    fn temperature(self, qtype: i64, options: usize) -> f32 {
+        match (self, qtype, options) {
+            (Variant::English, 2, _) => 1.9834,
+            (Variant::English, _, 2) => 1.9064,
+            (Variant::English, _, 3..=5) => 1.7602,
+            (Variant::Typed, 2, _) => 1.0575,
+            (Variant::Typed, _, _) => 1.0148,
+            _ => 1.0,
+        }
+    }
+}
+
 // Repeated lines reuse their answer. ponytail: cleared when full, swap for an LRU if it ever thrashes.
 const CACHE_MAX: usize = 50_000;
 
@@ -27,7 +68,9 @@ pub struct Model {
     session: Session,
     tok: Tokenizer,
     special: [u32; 3], // cls, sep, mask
+    variant: Variant,
     max_len: usize,
+    head_max_len: usize,
     fuzzy: bool,
     cache: HashMap<(usize, String), Vec<f32>>,
     /// Real forward passes so far; the rest were answered from the cache.
@@ -35,19 +78,29 @@ pub struct Model {
 }
 
 impl Model {
-    /// `max_len` caps tokens per record (question included); longer text is cut. `threads` = 0 lets ONNX Runtime use every core. `fuzzy` answers lines that differ only in numbers and ids once.
-    pub fn load(fuzzy: bool, threads: usize, max_len: usize) -> Result<Self> {
-        let dir = model_dir()?;
+    /// `max_len` caps tokens per record (question included, default: the checkpoint's own); longer text is cut.
+    /// `threads` = 0 lets ONNX Runtime use every core. `fuzzy` answers lines that differ only in numbers and ids once.
+    pub fn load(variant: Variant, fuzzy: bool, threads: usize, max_len: Option<usize>, gpu: bool) -> Result<Self> {
+        let spec = variant.spec();
+        let dir = model_dir(&spec)?;
         let tok = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(anyhow::Error::msg)?;
         let id = |t: &str| tok.token_to_id(t).with_context(|| format!("tokenizer has no {t}"));
-        let special = [id("<bos>")?, id("<eos>")?, id("<mask>")?];
+        let special = [id(spec.special[0])?, id(spec.special[1])?, id(spec.special[2])?];
         let path = std::env::var_os("GUTCHECK_MODEL").map(PathBuf::from).unwrap_or(dir.join("model.onnx"));
         let mut builder = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3).map_err(|e| anyhow::anyhow!("{e}"))?;
         if threads > 0 {
             builder = builder.with_intra_threads(threads).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
-        Ok(Self { session: builder.commit_from_file(&path)?, tok, special, max_len, fuzzy, cache: HashMap::new(), calls: 0 })
+        if gpu {
+            #[cfg(target_os = "macos")]
+            {
+                builder = builder.with_execution_providers([ort::ep::CoreML::default().build()]).map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            #[cfg(not(target_os = "macos"))]
+            eprintln!("gutcheck: --gpu needs the macOS build (Core ML); running on the CPU");
+        }
+        Ok(Self { session: builder.commit_from_file(&path)?, tok, special, variant, max_len: max_len.unwrap_or(spec.max_len), head_max_len: spec.head_max_len, fuzzy, cache: HashMap::new(), calls: 0 })
     }
 
     fn enc(&self, s: &str) -> Result<Vec<u32>> {
@@ -83,7 +136,7 @@ impl Model {
             return Ok(p.clone());
         }
         let [cls, sep, _] = self.special;
-        let (ids, markers) = build_sequence(q, &self.enc(text)?, cls, sep, self.max_len, HEAD_MAX_LEN);
+        let (ids, markers) = build_sequence(q, &self.enc(text)?, cls, sep, self.max_len, self.head_max_len);
         let (len, k) = (ids.len(), markers.len());
         let outputs = self.session.run(ort::inputs! {
             "input_ids" => Tensor::from_array(([1, len], ids.iter().map(|&t| t as i64).collect::<Vec<_>>()))?,
@@ -93,7 +146,9 @@ impl Model {
             "qtype" => Tensor::from_array(([1], vec![q.qtype]))?,
         })?;
         self.calls += 1;
-        let p = softmax(&outputs["logits"].try_extract_tensor::<f32>()?.1[..k]);
+        let t = self.variant.temperature(q.qtype, k);
+        let logits: Vec<f32> = outputs["logits"].try_extract_tensor::<f32>()?.1[..k].iter().map(|z| z / t).collect();
+        let p = softmax(&logits);
         if self.cache.len() >= CACHE_MAX {
             self.cache.clear();
         }
@@ -169,12 +224,12 @@ pub fn template(line: &str) -> String {
 }
 
 /// Where the model lives; downloads it (with a progress readout) the first time.
-fn model_dir() -> Result<PathBuf> {
+fn model_dir(spec: &Spec) -> Result<PathBuf> {
     let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))
         .context("set XDG_CACHE_HOME or HOME")?;
-    let dir = cache.join("gutcheck").join("laya-multilingual-0966c4f");
-    for (remote, local) in FILES {
+    let dir = cache.join("gutcheck").join(spec.dir);
+    for (remote, local) in [(spec.onnx, "model.onnx"), (spec.tokenizer, "tokenizer.json")] {
         let dest = dir.join(local);
         if dest.exists() {
             continue;
@@ -182,10 +237,10 @@ fn model_dir() -> Result<PathBuf> {
         std::fs::create_dir_all(&dir)?;
         eprintln!("gutcheck: first run, downloading {local} to {} ...", dir.display());
         let tmp = dest.with_extension("part");
-        let resp = ureq::get(&format!("{REPO}/{remote}")).call()?;
+        let resp = ureq::get(&format!("{}/{remote}", spec.repo)).call()?;
         let total = resp.body().content_length().unwrap_or(0);
         let mut body = resp.into_body();
-        let (mut r, mut f, mut buf, mut done) = (body.as_reader(), std::fs::File::create(&tmp)?, vec![0u8; 1 << 20], 0u64);
+        let (mut r, mut f, mut buf, mut done, mut last_pct) = (body.as_reader(), std::fs::File::create(&tmp)?, vec![0u8; 1 << 20], 0u64, u64::MAX);
         loop {
             let n = r.read(&mut buf)?;
             if n == 0 {
@@ -193,9 +248,11 @@ fn model_dir() -> Result<PathBuf> {
             }
             f.write_all(&buf[..n])?;
             done += n as u64;
-            if total > 0 {
-                eprint!("\r  {:>3}% of {} MB", done * 100 / total, total >> 20);
+            let pct = if total > 0 { done * 100 / total } else { 0 };
+            if pct != last_pct && std::io::stderr().is_terminal() {
+                eprint!("\r  {pct:>3}% of {} MB", total >> 20);
             }
+            last_pct = pct;
         }
         eprintln!();
         std::fs::rename(&tmp, &dest)?;

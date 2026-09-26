@@ -3,12 +3,14 @@
 mod input;
 mod model;
 mod output;
+mod packs;
+mod tui;
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use ignore::{overrides::OverrideBuilder, WalkBuilder};
 use input::{Mode, Record};
-use model::{template, Model, Question};
+use model::{template, Model, Question, Variant};
 use output::{Printer, Shown};
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, IsTerminal};
@@ -42,6 +44,9 @@ struct Cli {
     /// Print every record with the best of these labels, `label` or `label=description`
     #[arg(short, long, value_name = "A,B,C")]
     choice: Option<String>,
+    /// Find the cut-off yourself: split the scores into a yes group and a no group (reads everything first)
+    #[arg(long, conflicts_with_all = ["score", "rank", "top", "choice"])]
+    auto: bool,
     /// Print every record ranked by P(yes), best first
     #[arg(long)]
     rank: bool,
@@ -67,6 +72,12 @@ struct Cli {
     /// Judge one field of each JSON line (`a.b` for nested); prints the whole line
     #[arg(long, value_name = "NAME")]
     field: Option<String>,
+    /// With --field: the input is CSV, and NAME is a column
+    #[arg(long, requires = "field")]
+    csv: bool,
+    /// Also show the model this many lines either side of each line (reads the whole input first)
+    #[arg(short = 'C', long, value_name = "N", default_value_t = 0)]
+    context: usize,
 
     /// Search directories recursively (respects .gitignore)
     #[arg(short, long)]
@@ -100,12 +111,30 @@ struct Cli {
     /// Treat lines that differ only in numbers, timestamps and ids as one line (one model call per shape; big speedup on logs)
     #[arg(short, long)]
     fuzzy: bool,
+    /// List the built-in and your own named questions (@name) and exit
+    #[arg(long)]
+    questions: bool,
+    /// Print a shell completion script and exit
+    #[arg(long, value_name = "SHELL")]
+    completions: Option<clap_complete::Shell>,
+    /// Print the man page and exit
+    #[arg(long)]
+    man: bool,
+    /// Explore the scores in a live terminal view: move the threshold, sort, re-ask
+    #[arg(short = 'i', long, conflicts_with_all = ["choice", "count", "files_with_matches", "quiet", "json"])]
+    interactive: bool,
     /// Read everything and report how many model calls it would take, without loading the model
     #[arg(long)]
     estimate: bool,
-    /// Cap on tokens per record, question included; longer text is cut (lower is faster)
-    #[arg(long, default_value_t = 1024, value_name = "N")]
-    max_tokens: usize,
+    /// Cap on tokens per record, question included; longer text is cut (default: the model's own limit)
+    #[arg(long, value_name = "N")]
+    max_tokens: Option<usize>,
+    /// Which Laya checkpoint to run (default: multilingual, or typed when you use a named question)
+    #[arg(short = 'M', long, value_enum)]
+    model: Option<Variant>,
+    /// Run on the Apple GPU and Neural Engine through Core ML (macOS)
+    #[arg(long)]
+    gpu: bool,
     /// CPU threads for the model (default: all)
     #[arg(long, default_value_t = 0, value_name = "N")]
     threads: usize,
@@ -120,6 +149,9 @@ fn main() {
     std::process::exit(match run() {
         Ok(code) => code,
         Err(e) => {
+            if e.chain().any(|c| c.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)) {
+                std::process::exit(0); // downstream closed, e.g. `| head`
+            }
             eprintln!("gutcheck: {e:#}");
             2
         }
@@ -128,6 +160,20 @@ fn main() {
 
 fn run() -> Result<i32> {
     let cli = Cli::parse();
+    if cli.questions {
+        for (name, q) in packs::all() {
+            println!("@{name:<11} {q}");
+        }
+        return Ok(0);
+    }
+    if let Some(shell) = cli.completions {
+        clap_complete::generate(shell, &mut Cli::command(), "gutcheck", &mut std::io::stdout());
+        return Ok(0);
+    }
+    if cli.man {
+        clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+        return Ok(0);
+    }
     let (questions, paths) = if cli.more.is_empty() {
         match cli.args.split_first() {
             Some((q, p)) => (vec![q.clone()], p.to_vec()),
@@ -145,22 +191,27 @@ fn run() -> Result<i32> {
     if cli.choice.is_some() && labels.len() < 2 {
         bail!("--choice needs at least two comma-separated labels");
     }
+    let used_pack = questions.iter().any(|q| q.starts_with('@'));
+    let questions = questions.iter().map(|q| packs::resolve(q)).collect::<Result<Vec<_>>>()?;
+    // Named questions were tuned on the typed checkpoint, which is far more accurate on English than the multilingual one.
+    let variant = cli.model.unwrap_or(if used_pack { Variant::Typed } else { Variant::Multilingual });
     let questions = match (questions.is_empty(), labels.is_empty()) {
         (false, _) => questions,
         (true, false) => vec!["Which category does this text belong to?".into()],
         (true, true) => bail!("give a question, e.g. gutcheck \"is this a bug report?\" app.log"),
     };
     let mode = match (&cli.field, cli.para, cli.whole, cli.diff) {
+        (Some(f), ..) if cli.csv => Mode::Csv(f.clone()),
         (Some(f), ..) => Mode::Field(f.clone()),
         (_, true, ..) => Mode::Para,
         (_, _, true, _) => Mode::Whole,
         (_, _, _, true) => Mode::Diff,
-        _ => Mode::Lines,
+        _ => Mode::Lines(cli.context),
     };
     let sources = sources(&cli, &paths)?;
 
     if cli.estimate {
-        return estimate(&sources, &mode, questions.len());
+        return estimate(&sources, &mode, questions.len(), if variant == Variant::Multilingual { 10.0 } else { 4.0 });
     }
 
     let started = Instant::now();
@@ -168,9 +219,27 @@ fn run() -> Result<i32> {
     if tty {
         eprint!("\x1b[2m  loading model...\x1b[0m");
     }
-    let mut model = Model::load(cli.fuzzy, cli.threads, cli.max_tokens)?;
+    let mut model = Model::load(variant, cli.fuzzy, cli.threads, cli.max_tokens, cli.gpu)?;
     if tty {
         eprint!("\r\x1b[K");
+    }
+    if cli.interactive {
+        let mut records = vec![];
+        for src in &sources {
+            let Some((name, reader)) = open(src)? else { continue };
+            input::read(reader, &name, &mode, &mut |r| { records.push(r); Ok(true) })?;
+        }
+        let picked = tui::run(model, records, questions.clone(), cli.all, cli.min_prob)?;
+        let mut printer = Printer::new();
+        printer.with_file = cli.with_filename || sources.len() > 1 || matches!(mode, Mode::Diff);
+        printer.line_number = cli.line_number;
+        let picked = picked.unwrap_or_default();
+        for rec in &picked {
+            if printer.record(rec, Shown::Plain).is_err() {
+                break;
+            }
+        }
+        return Ok(if picked.is_empty() { 1 } else { 0 });
     }
     let qs: Vec<Question> = if labels.is_empty() {
         questions.iter().map(|q| model.yes_no(q)).collect::<Result<_>>()?
@@ -183,7 +252,8 @@ fn run() -> Result<i32> {
     printer.line_number = cli.line_number;
 
     let rank = cli.rank || cli.top.is_some();
-    let filtering = labels.is_empty() && !cli.score && !rank;
+    let auto = cli.auto;
+    let filtering = labels.is_empty() && !cli.score && !rank && !auto;
     let mut ranked: Vec<(f32, Record)> = vec![];
     let mut tally = vec![0usize; labels.len()];
     let (mut judged, mut printed_total) = (0usize, 0usize);
@@ -220,7 +290,7 @@ fn run() -> Result<i32> {
                     ps.push(model.probs(i, q, &rec.judge)?[1]);
                 }
                 let p = if cli.all { ps.iter().cloned().fold(f32::MAX, f32::min) } else { ps.iter().cloned().fold(f32::MIN, f32::max) };
-                if cli.score || rank { (true, Shown::Score(p)) } else { ((p >= cli.min_prob) != cli.invert, Shown::Plain) }
+                if cli.score || rank || auto { (true, Shown::Score(p)) } else { ((p >= cli.min_prob) != cli.invert, Shown::Plain) }
             };
             if !hit {
                 return Ok(true);
@@ -228,7 +298,7 @@ fn run() -> Result<i32> {
             in_file += 1;
             any_match |= filtering;
             printed_total += 1;
-            if rank {
+            if rank || auto {
                 if let Shown::Score(p) = shown {
                     ranked.push((p, rec));
                 }
@@ -261,6 +331,19 @@ fn run() -> Result<i32> {
             let _ = printer.line(&line, false);
         }
     }
+    let mut cutoff_note = String::new();
+    if auto {
+        let cut = auto_cutoff(&ranked.iter().map(|r| r.0).collect::<Vec<_>>());
+        cutoff_note = format!(" · cut-off {cut:.2} (auto)");
+        for (p, rec) in &ranked {
+            if (*p >= cut) != cli.invert {
+                any_match = true;
+                if printer.record(rec, Shown::Plain).is_err() {
+                    break;
+                }
+            }
+        }
+    }
     if rank {
         ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
         for (p, rec) in ranked.iter().take(cli.top.unwrap_or(usize::MAX)) {
@@ -277,10 +360,32 @@ fn run() -> Result<i32> {
         let asked = judged * qs.len();
         let reused = if asked > model.calls { format!(" ({} reused)", asked - model.calls) } else { String::new() };
         let head = if filtering { format!("{printed_total} of {judged} matched") } else { format!("{judged} records") };
-        eprintln!("\x1b[2m  {head} · {} model calls{reused} · {:.1} s\x1b[0m", model.calls, started.elapsed().as_secs_f32());
+        eprintln!("\x1b[2m  {head}{cutoff_note} · {} model calls{reused} · {:.1} s\x1b[0m", model.calls, started.elapsed().as_secs_f32());
     }
     // Like grep: 0 if something matched, 1 if not, 2 on error. Score and label modes always print, so they exit 0.
-    Ok(if had_error { 2 } else if filtering && !any_match { 1 } else { 0 })
+    Ok(if had_error { 2 } else if (filtering || auto) && !any_match { 1 } else { 0 })
+}
+
+/// Otsu's method on the log-odds of the scores: the cut that best separates a "yes" group from a "no" group.
+/// Falls back to 0.5 when there is nothing to separate.
+fn auto_cutoff(scores: &[f32]) -> f32 {
+    let mut z: Vec<f32> = scores.iter().map(|p| { let p = p.clamp(1e-4, 1.0 - 1e-4); (p / (1.0 - p)).ln() }).collect();
+    z.sort_by(|a, b| a.total_cmp(b));
+    let n = z.len();
+    if n < 4 || z[n - 1] - z[0] < 1.0 {
+        return 0.5;
+    }
+    let total: f32 = z.iter().sum();
+    let (mut below, mut best, mut cut) = (0.0f32, -1.0f32, 0.0f32);
+    for k in 1..n {
+        below += z[k - 1];
+        let (n0, n1) = (k as f32, (n - k) as f32);
+        let between = n0 * n1 * (below / n0 - (total - below) / n1).powi(2);
+        if between > best {
+            (best, cut) = (between, (z[k - 1] + z[k]) / 2.0);
+        }
+    }
+    1.0 / (1.0 + (-cut).exp())
 }
 
 /// stdin, the files named, or (with -r) every file under the directories named.
@@ -334,8 +439,8 @@ fn open(src: &Src) -> Result<Option<(String, Box<dyn BufRead>)>> {
     })
 }
 
-/// How many model calls the run would take, at the measured ~10 calls/s on a laptop CPU.
-fn estimate(sources: &[Src], mode: &Mode, questions: usize) -> Result<i32> {
+/// How many model calls the run would take, at the measured calls per second on a laptop CPU.
+fn estimate(sources: &[Src], mode: &Mode, questions: usize, calls_per_sec: f64) -> Result<i32> {
     let (mut total, mut distinct, mut shapes) = (0usize, HashSet::new(), HashSet::new());
     for src in sources {
         let Some((name, reader)) = open(src)? else { continue };
@@ -346,7 +451,7 @@ fn estimate(sources: &[Src], mode: &Mode, questions: usize) -> Result<i32> {
             Ok(true)
         })?;
     }
-    let secs = |n: usize| format!("{:.0} s", (n * questions) as f64 / 10.0);
+    let secs = |n: usize| format!("{:.0} s", (n * questions) as f64 / calls_per_sec);
     println!("records         {total}");
     println!("distinct        {:<8} about {}", distinct.len(), secs(distinct.len()));
     println!("with --fuzzy    {:<8} about {}", shapes.len(), secs(shapes.len()));

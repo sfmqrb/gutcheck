@@ -16,4 +16,4 @@ gutcheck's code is MIT (see `LICENSE`). Apache-2.0 model weights are fetched sep
 
 ## Code map
 
-Four small files in `src/`: `model.rs` (download, prompt layout, scoring, cache), `input.rs` (lines, paragraphs, JSON fields, diff hunks), `output.rs` (plain, scored, labelled, JSON, colors) and `main.rs` (options, files, grep flags, exit codes).
+Small files in `src/`: `model.rs` (models, prompt layout, scoring, cache), `input.rs` (lines, paragraphs, JSON, CSV, diff hunks), `output.rs` (plain, scored, labelled, JSON, colors), `packs.rs` (named questions), `tui.rs` (the live view) and `main.rs` (options, files, grep flags, exit codes).

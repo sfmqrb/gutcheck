@@ -3,6 +3,7 @@ use anyhow::Result;
 use std::io::BufRead;
 
 /// One thing to judge. `judge` goes to the model, `show` is what gets printed.
+#[derive(Clone)]
 pub struct Record {
     pub file: String,
     pub line: usize,
@@ -11,10 +12,12 @@ pub struct Record {
 }
 
 pub enum Mode {
-    Lines,
+    /// Each line; the number is how many neighbouring lines either side the model also sees.
+    Lines(usize),
     Para,
     Whole,
     Field(String),
+    Csv(String),
     Diff,
 }
 
@@ -23,10 +26,20 @@ pub fn read(r: impl BufRead, file: &str, mode: &Mode, f: &mut dyn FnMut(Record) 
     let mut rec = |line: usize, judge: String, show: String| f(Record { file: file.to_string(), line, judge, show });
     let lines = r.split(b'\n').map(|l| l.map(|b| String::from_utf8_lossy(&b).trim_end_matches('\r').to_string()));
     match mode {
-        Mode::Lines => {
+        Mode::Lines(0) => {
             for (i, l) in lines.enumerate() {
                 let l = l?;
                 if !rec(i + 1, l.clone(), l)? {
+                    break;
+                }
+            }
+        }
+        Mode::Lines(n) => {
+            // Needs the whole input to look ahead, so it does not stream.
+            let all = lines.collect::<std::io::Result<Vec<_>>>()?;
+            for (i, l) in all.iter().enumerate() {
+                let window = all[i.saturating_sub(*n)..(i + n + 1).min(all.len())].join("\n");
+                if !rec(i + 1, window, l.clone())? {
                     break;
                 }
             }
@@ -76,6 +89,21 @@ pub fn read(r: impl BufRead, file: &str, mode: &Mode, f: &mut dyn FnMut(Record) 
                 }
             }
         }
+        Mode::Csv(name) => {
+            let bytes = lines_to_bytes(lines)?;
+            let mut rd = csv::ReaderBuilder::new().flexible(true).from_reader(bytes.as_slice());
+            let Some(col) = rd.headers()?.iter().position(|h| h == name) else { anyhow::bail!("{file}: no column named {name}") };
+            for (i, row) in rd.records().enumerate() {
+                let row = row?;
+                let Some(value) = row.get(col) else { continue };
+                let mut w = csv::Writer::from_writer(vec![]);
+                w.write_record(&row)?;
+                let show = String::from_utf8_lossy(&w.into_inner()?).trim_end().to_string();
+                if !rec(i + 2, value.to_string(), show)? {
+                    break;
+                }
+            }
+        }
         Mode::Diff => {
             // A hunk runs from its `@@` line while lines start with ' ', '+', '-' or '\'. Works on `git diff` and `git log -p`.
             let (mut path, mut hunk): (String, Option<(usize, String)>) = (file.to_string(), None);
@@ -114,6 +142,10 @@ pub fn read(r: impl BufRead, file: &str, mode: &Mode, f: &mut dyn FnMut(Record) 
     Ok(())
 }
 
+fn lines_to_bytes(lines: impl Iterator<Item = std::io::Result<String>>) -> Result<Vec<u8>> {
+    Ok(lines.collect::<std::io::Result<Vec<_>>>()?.join("\n").into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,7 +158,9 @@ mod tests {
 
     #[test]
     fn modes() {
-        assert_eq!(collect("a\nb\n", Mode::Lines).len(), 2);
+        assert_eq!(collect("a\nb\n", Mode::Lines(0)).len(), 2);
+        assert_eq!(collect("a\nb\nc\n", Mode::Lines(1))[1].2, "a\nb\nc");
+        assert_eq!(collect("id,msg\n1,\"hi, you\"\n2,bye\n", Mode::Csv("msg".into())).iter().map(|r| (r.1, r.2.clone())).collect::<Vec<_>>(), vec![(2, "hi, you".to_string()), (3, "bye".to_string())]);
         assert_eq!(collect("a\nb\n\nc\n", Mode::Para), vec![("f".into(), 1, "a\nb".into()), ("f".into(), 4, "c".into())]);
         assert_eq!(collect("{\"m\":\"x\",\"n\":{\"k\":3}}\nnope\n{\"m\":\"y\"}\n", Mode::Field("m".into())).iter().map(|r| r.2.clone()).collect::<Vec<_>>(), vec!["x", "y"]);
         assert_eq!(collect("{\"n\":{\"k\":3}}\n", Mode::Field("n.k".into()))[0].2, "3");

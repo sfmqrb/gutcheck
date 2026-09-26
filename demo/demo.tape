@@ -1,4 +1,4 @@
-# vhs demo/demo.tape   (needs target/release/gutcheck and the model cached: run gutcheck once first)
+# vhs demo/demo.tape   (needs target/release/gutcheck and the models cached: run gutcheck once with each of -M multilingual and @secret first)
 Output demo/demo.gif
 Set Shell "bash"
 Set FontSize 17
@@ -10,7 +10,7 @@ Set MarginFill "#282a36"
 Set BorderRadius 12
 Set WindowBar Colorful
 Set Theme "Dracula"
-Set TypingSpeed 28ms
+Set TypingSpeed 24ms
 
 Hide
 Type "export CLICOLOR_FORCE=1 PATH=$PWD/target/release:$PATH && cd examples && source ../demo/prompt.sh" Enter
@@ -22,15 +22,38 @@ Hide
 Type "clear; cap 'filter: grep, but the pattern is a question'" Enter
 Show
 Type `gutcheck -n "is this a bug report?" issues.txt` Enter
-Sleep 7.5s
+Sleep 7s
+
+Hide
+Type "clear; cap 'named questions: hunt credentials in a repo'" Enter
+Show
+Type `gutcheck @secret -r repo` Enter
+Sleep 14s
 
 Hide
 Type "clear; cap 'logs: 72 lines, 8 model calls, ranked'" Enter
 Show
-Type `gutcheck --estimate "does this describe an error?" access.log` Enter
-Sleep 2.5s
 Type `gutcheck -f --top 6 "does this log line describe an error?" access.log` Enter
-Sleep 9s
+Sleep 8s
+
+Hide
+Type "clear; cap 'explore: move the threshold, ask something new'" Enter
+Show
+Type `gutcheck -i -f "does this log line describe an error?" access.log` Enter
+Sleep 8s
+Right
+Sleep 400ms
+Right
+Sleep 1s
+Type "/"
+Type "does this mention a slow query?"
+Sleep 500ms
+Enter
+Sleep 7s
+Type "s"
+Sleep 1500ms
+Type "q"
+Sleep 500ms
 
 Hide
 Type "clear; cap 'diffs: judge each hunk'" Enter
@@ -39,13 +62,7 @@ Type `gutcheck --diff "removes a security or permission check" change.diff` Ente
 Sleep 8s
 
 Hide
-Type "clear; cap 'classify: your own labels, any language'" Enter
-Show
-Type `gutcheck -c bug,billing,question,praise "what is this message about?" support.txt` Enter
-Sleep 8s
-
-Hide
-Type "clear; cap 'tally: the shape of a whole file'" Enter
+Type "clear; cap 'tally: the shape of a whole file, in any language'" Enter
 Show
 Type `gutcheck -c bug,billing,question,praise --tally "what is this message about?" support.txt` Enter
 Sleep 8s
