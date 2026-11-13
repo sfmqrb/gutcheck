@@ -38,28 +38,29 @@ fn worker(mut model: Model, texts: Vec<String>, all: bool, cmds: Receiver<Cmd>, 
                 continue;
             }
         };
-        for (i, text) in texts.iter().enumerate() {
+        let todo: Vec<usize> = (0..texts.len()).collect();
+        'run: for chunk in todo.chunks(model.batch) {
             if let Ok(newer) = cmds.try_recv() {
                 next = Some(newer);
                 break;
             }
-            let p = if text.trim().is_empty() {
-                0.0
-            } else {
-                let mut ps = vec![];
-                for (k, q) in qs.iter().enumerate() {
-                    match model.probs(gen as usize * 64 + k, q, text) {
-                        Ok(p) => ps.push(p[1]),
-                        Err(e) => {
-                            let _ = out.send(Msg::Failed(format!("{e:#}")));
-                            return;
-                        }
+            let batch: Vec<&str> = chunk.iter().map(|&i| texts[i].as_str()).filter(|t| !t.trim().is_empty()).collect();
+            let mut best = vec![if all { f32::MAX } else { f32::MIN }; batch.len()];
+            for (k, q) in qs.iter().enumerate() {
+                match model.probs(gen as usize * 64 + k, q, &batch) {
+                    Ok(ps) => best.iter_mut().zip(ps).for_each(|(b, p)| *b = if all { b.min(p[1]) } else { b.max(p[1]) }),
+                    Err(e) => {
+                        let _ = out.send(Msg::Failed(format!("{e:#}")));
+                        return;
                     }
                 }
-                if all { ps.iter().cloned().fold(f32::MAX, f32::min) } else { ps.iter().cloned().fold(f32::MIN, f32::max) }
-            };
-            if out.send(Msg::Score(gen, i, p)).is_err() {
-                return;
+            }
+            let mut best = best.into_iter();
+            for &i in chunk {
+                let p = if texts[i].trim().is_empty() { 0.0 } else { best.next().unwrap_or(0.0) };
+                if out.send(Msg::Score(gen, i, p)).is_err() {
+                    break 'run;
+                }
             }
         }
         if next.is_none() {

@@ -66,6 +66,7 @@ slow = does this describe something slow?
 | `-f`, `--fuzzy` | Lines that differ only in numbers, timestamps and ids are answered once. See [benchmarks](benchmarks.md). |
 | `--estimate` | Read the input and report how many model calls it needs, with and without `--fuzzy`. Does not load the model. |
 | `--gpu` | Run on the Apple GPU and Neural Engine through Core ML (macOS builds). |
+| `--batch N` | Records per model call (default 8). |
 | `--max-tokens N`, `--threads N` | Cap tokens per record; CPU threads. |
 
 Identical lines are always answered once, and empty records are skipped without a model call.

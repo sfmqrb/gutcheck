@@ -135,6 +135,9 @@ struct Cli {
     /// Run on the Apple GPU and Neural Engine through Core ML (macOS)
     #[arg(long)]
     gpu: bool,
+    /// Records per model call at most; bigger is faster on many cores
+    #[arg(long, default_value_t = 8, value_name = "N", value_parser = clap::value_parser!(u16).range(1..))]
+    batch: u16,
     /// CPU threads for the model (default: all)
     #[arg(long, default_value_t = 0, value_name = "N")]
     threads: usize,
@@ -220,6 +223,7 @@ fn run() -> Result<i32> {
         eprint!("\x1b[2m  loading model...\x1b[0m");
     }
     let mut model = Model::load(variant, cli.fuzzy, cli.threads, cli.max_tokens, cli.gpu)?;
+    model.batch = cli.batch.into();
     if tty {
         eprint!("\r\x1b[K");
     }
@@ -241,10 +245,11 @@ fn run() -> Result<i32> {
         }
         return Ok(if picked.is_empty() { 1 } else { 0 });
     }
-    let qs: Vec<Question> = if labels.is_empty() {
-        questions.iter().map(|q| model.yes_no(q)).collect::<Result<_>>()?
-    } else {
+    let choice = !labels.is_empty();
+    let qs: Vec<Question> = if choice {
         model.choice(&questions[0], &labels.iter().map(|l| l.1.clone()).collect::<Vec<_>>()).map(|q| vec![q])?
+    } else {
+        questions.iter().map(|q| model.yes_no(q)).collect::<Result<_>>()?
     };
     let mut printer = Printer::new();
     printer.json = cli.json;
@@ -252,16 +257,14 @@ fn run() -> Result<i32> {
     printer.line_number = cli.line_number;
 
     let rank = cli.rank || cli.top.is_some();
-    let auto = cli.auto;
-    let filtering = labels.is_empty() && !cli.score && !rank && !auto;
-    let mut ranked: Vec<(f32, Record)> = vec![];
+    let hold = rank || cli.auto; // needs every score before printing anything
+    let filtering = !choice && !cli.score && !rank;
+    let mut held: Vec<(usize, f32, Record)> = vec![]; // (file, P(yes), record)
+    let mut names = vec![];
     let mut tally = vec![0usize; labels.len()];
-    let (mut judged, mut printed_total) = (0usize, 0usize);
-    let (mut any_match, mut had_error, mut stop) = (false, false, false);
+    let mut grep = Grep::default();
+    let (mut judged, mut had_error) = (0usize, false);
     for src in &sources {
-        if stop {
-            break;
-        }
         let (name, reader) = match open(src) {
             Ok(Some(x)) => x,
             Ok(None) => continue, // binary
@@ -271,99 +274,133 @@ fn run() -> Result<i32> {
                 continue;
             }
         };
-        let mut in_file = 0usize;
-        let mut handle = |rec: Record| -> Result<bool> {
-            if rec.judge.trim().is_empty() {
-                return Ok(true); // nothing to judge, no model call
-            }
-            judged += 1;
-            let shown_label;
-            let (hit, shown) = if !labels.is_empty() {
-                let p = model.probs(0, &qs[0], &rec.judge)?;
-                let best = (0..p.len()).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap();
-                shown_label = labels[best].0.clone();
-                tally[best] += 1;
-                (true, Shown::Label(best, &shown_label))
-            } else {
-                let mut ps = Vec::with_capacity(qs.len());
-                for (i, q) in qs.iter().enumerate() {
-                    ps.push(model.probs(i, q, &rec.judge)?[1]);
+        'file: for batch in input::batches(reader, &name, &mode, model.batch) {
+            let mut batch = batch?;
+            batch.retain(|r| !r.judge.trim().is_empty()); // nothing to judge, no model call
+            judged += batch.len();
+            let verdicts = judge(&mut model, &qs, choice, cli.all, &batch)?;
+            for (rec, v) in batch.into_iter().zip(verdicts) {
+                let shown = match v {
+                    Verdict::Label(best) => {
+                        tally[best] += 1;
+                        Shown::Label(best, &labels[best].0)
+                    }
+                    Verdict::Yes(p) if hold => {
+                        held.push((names.len(), p, rec));
+                        continue;
+                    }
+                    Verdict::Yes(p) if cli.score => Shown::Score(p),
+                    Verdict::Yes(p) if (p >= cli.min_prob) != cli.invert => Shown::Plain,
+                    Verdict::Yes(_) => continue,
+                };
+                if !grep.hit(&cli, &mut printer, &name, &rec, shown)? {
+                    break 'file;
                 }
-                let p = if cli.all { ps.iter().cloned().fold(f32::MAX, f32::min) } else { ps.iter().cloned().fold(f32::MIN, f32::max) };
-                if cli.score || rank || auto { (true, Shown::Score(p)) } else { ((p >= cli.min_prob) != cli.invert, Shown::Plain) }
-            };
-            if !hit {
-                return Ok(true);
             }
-            in_file += 1;
-            any_match |= filtering;
-            printed_total += 1;
-            if rank || auto {
-                if let Shown::Score(p) = shown {
-                    ranked.push((p, rec));
-                }
-                return Ok(true);
-            }
-            let printed = if cli.quiet {
-                Ok(())
-            } else if cli.files_with_matches {
-                printer.line(&name, true)
-            } else if cli.count || cli.tally {
-                Ok(())
-            } else {
-                printer.record(&rec, shown)
-            };
-            if let Err(e) = printed {
-                if e.kind() == std::io::ErrorKind::BrokenPipe {
-                    stop = true; // downstream closed (e.g. `| head`)
-                    return Ok(false);
-                }
-                return Err(e.into());
-            }
-            if cli.quiet {
-                stop = true;
-            }
-            Ok(!(cli.quiet || cli.files_with_matches || cli.max_count.is_some_and(|m| in_file >= m)))
-        };
-        input::read(reader, &name, &mode, &mut handle)?;
-        if cli.count && !stop {
-            let line = if printer.with_file { format!("{name}:{in_file}") } else { in_file.to_string() };
-            let _ = printer.line(&line, false);
+        }
+        if !hold {
+            grep.end_file(&cli, &mut printer, &name)?;
+        }
+        names.push(name);
+        if grep.stop {
+            break;
         }
     }
     let mut cutoff_note = String::new();
-    if auto {
-        let cut = auto_cutoff(&ranked.iter().map(|r| r.0).collect::<Vec<_>>());
+    if cli.auto {
+        // Now that every score is known, filter file by file as above.
+        let cut = auto_cutoff(&held.iter().map(|h| h.1).collect::<Vec<_>>());
         cutoff_note = format!(" · cut-off {cut:.2} (auto)");
-        for (p, rec) in &ranked {
-            if (*p >= cut) != cli.invert {
-                any_match = true;
-                if printer.record(rec, Shown::Plain).is_err() {
-                    break;
+        let mut held = held.into_iter().peekable();
+        for (i, name) in names.iter().enumerate() {
+            let mut open = true;
+            while let Some((_, p, rec)) = held.next_if(|h| h.0 == i) {
+                if open && (p >= cut) != cli.invert {
+                    open = grep.hit(&cli, &mut printer, name, &rec, Shown::Plain)?;
                 }
             }
-        }
-    }
-    if rank {
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
-        for (p, rec) in ranked.iter().take(cli.top.unwrap_or(usize::MAX)) {
-            if printer.record(rec, Shown::Score(*p)).is_err() {
+            grep.end_file(&cli, &mut printer, name)?;
+            if grep.stop {
                 break;
             }
         }
+    } else if rank && !cli.quiet {
+        held.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (_, p, rec) in held.iter().take(cli.top.unwrap_or(usize::MAX)) {
+            printer.record(rec, Shown::Score(*p))?;
+        }
     }
     if cli.tally {
-        let rows: Vec<(String, usize)> = labels.iter().map(|l| l.0.clone()).zip(tally).collect();
-        let _ = printer.tally(&rows);
+        printer.tally(&labels.iter().map(|l| l.0.clone()).zip(tally).collect::<Vec<_>>())?;
     }
     if tty && !cli.json {
         let asked = judged * qs.len();
         let reused = if asked > model.calls { format!(" ({} reused)", asked - model.calls) } else { String::new() };
-        let head = if filtering { format!("{printed_total} of {judged} matched") } else { format!("{judged} records") };
+        let head = if filtering { format!("{} of {judged} matched", grep.matched) } else { format!("{judged} records") };
         eprintln!("\x1b[2m  {head}{cutoff_note} · {} model calls{reused} · {:.1} s\x1b[0m", model.calls, started.elapsed().as_secs_f32());
     }
     // Like grep: 0 if something matched, 1 if not, 2 on error. Score and label modes always print, so they exit 0.
-    Ok(if had_error { 2 } else if (filtering || auto) && !any_match { 1 } else { 0 })
+    Ok(if had_error { 2 } else if filtering && grep.matched == 0 { 1 } else { 0 })
+}
+
+enum Verdict {
+    /// P(yes), over several questions the highest (the lowest with --all)
+    Yes(f32),
+    /// The best label
+    Label(usize),
+}
+
+/// The model's answer for each record of a batch.
+fn judge(model: &mut Model, qs: &[Question], choice: bool, all: bool, batch: &[Record]) -> Result<Vec<Verdict>> {
+    let texts: Vec<&str> = batch.iter().map(|r| r.judge.as_str()).collect();
+    if choice {
+        let ps = model.probs(0, &qs[0], &texts)?;
+        return Ok(ps.iter().map(|p| Verdict::Label((0..p.len()).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap_or(0))).collect());
+    }
+    let mut best = vec![if all { f32::MAX } else { f32::MIN }; texts.len()];
+    for (i, q) in qs.iter().enumerate() {
+        for (b, p) in best.iter_mut().zip(model.probs(i, q, &texts)?) {
+            *b = if all { b.min(p[1]) } else { b.max(p[1]) };
+        }
+    }
+    Ok(best.into_iter().map(Verdict::Yes).collect())
+}
+
+/// grep's bookkeeping for the records that get printed: `-q`, `-l`, `-m`, `--count`.
+#[derive(Default)]
+struct Grep {
+    in_file: usize,
+    matched: usize,
+    /// `-q` found its match: read nothing more
+    stop: bool,
+}
+
+impl Grep {
+    /// Prints one record (or not, for `-q`, `--count`, `--tally`); false when its file needs nothing more.
+    fn hit(&mut self, cli: &Cli, printer: &mut Printer, name: &str, rec: &Record, shown: Shown) -> std::io::Result<bool> {
+        self.in_file += 1;
+        self.matched += 1;
+        if cli.quiet {
+            self.stop = true;
+            return Ok(false);
+        }
+        if cli.files_with_matches {
+            printer.line(name, true)?;
+            return Ok(false);
+        }
+        if !cli.count && !cli.tally {
+            printer.record(rec, shown)?;
+        }
+        Ok(cli.max_count.is_none_or(|m| self.in_file < m))
+    }
+
+    fn end_file(&mut self, cli: &Cli, printer: &mut Printer, name: &str) -> std::io::Result<()> {
+        if cli.count && !self.stop {
+            printer.line(&if printer.with_file { format!("{name}:{}", self.in_file) } else { self.in_file.to_string() }, false)?;
+        }
+        self.in_file = 0;
+        Ok(())
+    }
 }
 
 /// Otsu's method on the log-odds of the scores: the cut that best separates a "yes" group from a "no" group.
@@ -425,12 +462,12 @@ fn sources(cli: &Cli, paths: &[String]) -> Result<Vec<Src>> {
 }
 
 /// A named reader, or None for a binary file (skipped, like ripgrep).
-fn open(src: &Src) -> Result<Option<(String, Box<dyn BufRead>)>> {
+fn open(src: &Src) -> Result<Option<(String, Box<dyn BufRead + Send>)>> {
     Ok(match src {
-        Src::Stdin => Some(("-".into(), Box::new(std::io::stdin().lock()))),
+        Src::Stdin => Some(("-".into(), Box::new(BufReader::new(std::io::stdin())))),
         Src::File(p) => {
             let name = p.display().to_string();
-            let mut r = BufReader::new(std::fs::File::open(p).with_context(|| name.clone())?);
+            let mut r = BufReader::with_capacity(1 << 16, std::fs::File::open(p).with_context(|| name.clone())?);
             if r.fill_buf()?.iter().take(8192).any(|&b| b == 0) {
                 return Ok(None);
             }

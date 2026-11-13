@@ -11,6 +11,7 @@ pub struct Record {
     pub show: String,
 }
 
+#[derive(Clone)]
 pub enum Mode {
     /// Each line; the number is how many neighbouring lines either side the model also sees.
     Lines(usize),
@@ -19,6 +20,31 @@ pub enum Mode {
     Field(String),
     Csv(String),
     Diff,
+}
+
+/// Reads records on a thread and hands them over in batches of whatever is ready, up to `max`: a file fills
+/// every batch, a slow pipe (`tail -f`) gets each record as soon as it arrives. Dropping the iterator stops reading.
+pub fn batches(r: Box<dyn BufRead + Send>, file: &str, mode: &Mode, max: usize) -> impl Iterator<Item = Result<Vec<Record>>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(max * 4);
+    let (file, mode) = (file.to_string(), mode.clone());
+    std::thread::spawn(move || {
+        if let Err(e) = read(r, &file, &mode, &mut |rec| Ok(tx.send(Ok(rec)).is_ok())) {
+            let _ = tx.send(Err(e));
+        }
+    });
+    let mut failed = None;
+    std::iter::from_fn(move || {
+        let mut batch = vec![];
+        let mut next = if failed.is_some() { None } else { rx.recv().ok() };
+        while let Some(item) = next {
+            match item {
+                Ok(rec) => batch.push(rec),
+                Err(e) => failed = Some(e),
+            }
+            next = if batch.len() < max && failed.is_none() { rx.try_recv().ok() } else { None };
+        }
+        if batch.is_empty() { failed.take().map(Err) } else { Some(Ok(batch)) }
+    })
 }
 
 /// Calls `f` for every record; `f` returns false to stop reading this input.
@@ -149,6 +175,16 @@ fn lines_to_bytes(lines: impl Iterator<Item = std::io::Result<String>>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batches_keep_order_and_errors() {
+        let input = (1..=100).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let got: Vec<Vec<Record>> = batches(Box::new(std::io::Cursor::new(input)), "f", &Mode::Lines(0), 8).collect::<Result<_>>().unwrap();
+        assert!(got.iter().all(|b| !b.is_empty() && b.len() <= 8));
+        assert_eq!(got.concat().iter().map(|r| r.line).collect::<Vec<_>>(), (1..=100).collect::<Vec<_>>());
+        let bad = batches(Box::new(std::io::Cursor::new("id\n1\n")), "f", &Mode::Csv("nope".into()), 8).collect::<Vec<_>>();
+        assert!(matches!(&bad[..], [Err(_)]));
+    }
 
     fn collect(input: &str, mode: Mode) -> Vec<(String, usize, String)> {
         let mut out = vec![];

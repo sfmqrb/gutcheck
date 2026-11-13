@@ -2,7 +2,7 @@
 use anyhow::{Context, Result};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
@@ -23,7 +23,7 @@ struct Spec {
     onnx: &'static str,      // path of the graph in the remote repo
     tokenizer: &'static str, // path of tokenizer.json in the remote repo
     repo: &'static str,
-    special: [&'static str; 3], // cls, sep, mask
+    special: [&'static str; 4], // cls, sep, mask, pad
     max_len: usize,
     head_max_len: usize,
 }
@@ -35,9 +35,9 @@ impl Variant {
     fn spec(self) -> Spec {
         // max_len and head_max_len come from each checkpoint's rl_agent_config.json.
         match self {
-            Variant::Multilingual => Spec { dir: "laya-multilingual-0966c4f", onnx: "model-fp32.onnx", tokenizer: "tokenizer/tokenizer.json", repo: ONNX_MULTI, special: ["<bos>", "<eos>", "<mask>"], max_len: 1024, head_max_len: 256 },
-            Variant::English => Spec { dir: "laya-english-aeebb05", onnx: "english/laya.onnx", tokenizer: "english/tokenizer.json", repo: ONNX_EN, special: ["[CLS]", "[SEP]", "[MASK]"], max_len: 512, head_max_len: 192 },
-            Variant::Typed => Spec { dir: "laya-typed-aeebb05", onnx: "typed-decisions/laya-typed-decisions.onnx", tokenizer: "typed-decisions/tokenizer.json", repo: ONNX_EN, special: ["[CLS]", "[SEP]", "[MASK]"], max_len: 1024, head_max_len: 256 },
+            Variant::Multilingual => Spec { dir: "laya-multilingual-0966c4f", onnx: "model-fp32.onnx", tokenizer: "tokenizer/tokenizer.json", repo: ONNX_MULTI, special: ["<bos>", "<eos>", "<mask>", "<pad>"], max_len: 1024, head_max_len: 256 },
+            Variant::English => Spec { dir: "laya-english-aeebb05", onnx: "english/laya.onnx", tokenizer: "english/tokenizer.json", repo: ONNX_EN, special: ["[CLS]", "[SEP]", "[MASK]", "[PAD]"], max_len: 512, head_max_len: 192 },
+            Variant::Typed => Spec { dir: "laya-typed-aeebb05", onnx: "typed-decisions/laya-typed-decisions.onnx", tokenizer: "typed-decisions/tokenizer.json", repo: ONNX_EN, special: ["[CLS]", "[SEP]", "[MASK]", "[PAD]"], max_len: 1024, head_max_len: 256 },
         }
     }
 
@@ -56,6 +56,8 @@ impl Variant {
 
 // Repeated lines reuse their answer. ponytail: cleared when full, swap for an LRU if it ever thrashes.
 const CACHE_MAX: usize = 50_000;
+// Padded tokens per forward pass at most: long records attend quadratically, so they go in smaller batches.
+const BATCH_TOKENS: usize = 8192;
 
 /// A question the way Laya's `build_sequence` reads it.
 pub struct Question {
@@ -67,14 +69,16 @@ pub struct Question {
 pub struct Model {
     session: Session,
     tok: Tokenizer,
-    special: [u32; 3], // cls, sep, mask
+    special: [u32; 4], // cls, sep, mask, pad
     variant: Variant,
     max_len: usize,
     head_max_len: usize,
     fuzzy: bool,
     cache: HashMap<(usize, String), Vec<f32>>,
-    /// Real forward passes so far; the rest were answered from the cache.
+    /// Records scored by the model so far; the rest were answered from the cache.
     pub calls: usize,
+    /// Records per forward pass at most.
+    pub batch: usize,
 }
 
 impl Model {
@@ -85,7 +89,7 @@ impl Model {
         let dir = model_dir(&spec)?;
         let tok = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(anyhow::Error::msg)?;
         let id = |t: &str| tok.token_to_id(t).with_context(|| format!("tokenizer has no {t}"));
-        let special = [id(spec.special[0])?, id(spec.special[1])?, id(spec.special[2])?];
+        let special = [id(spec.special[0])?, id(spec.special[1])?, id(spec.special[2])?, id(spec.special[3])?];
         let path = std::env::var_os("GUTCHECK_MODEL").map(PathBuf::from).unwrap_or(dir.join("model.onnx"));
         let mut builder = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -100,7 +104,7 @@ impl Model {
             #[cfg(not(target_os = "macos"))]
             eprintln!("gutcheck: --gpu needs the macOS build (Core ML); running on the CPU");
         }
-        Ok(Self { session: builder.commit_from_file(&path)?, tok, special, variant, max_len: max_len.unwrap_or(spec.max_len), head_max_len: spec.head_max_len, fuzzy, cache: HashMap::new(), calls: 0 })
+        Ok(Self { session: builder.commit_from_file(&path)?, tok, special, variant, max_len: max_len.unwrap_or(spec.max_len), head_max_len: spec.head_max_len, fuzzy, cache: HashMap::new(), calls: 0, batch: 8 })
     }
 
     fn enc(&self, s: &str) -> Result<Vec<u32>> {
@@ -129,31 +133,69 @@ impl Model {
         })
     }
 
-    /// Probabilities over the question's options (yes/no: `[P(no), P(yes)]`). `id` tells questions apart in the cache.
-    pub fn probs(&mut self, id: usize, q: &Question, text: &str) -> Result<Vec<f32>> {
-        let key = (id, if self.fuzzy { template(text) } else { text.to_string() });
-        if let Some(p) = self.cache.get(&key) {
-            return Ok(p.clone());
+    /// Probabilities over the question's options for each text (yes/no: `[P(no), P(yes)]`). `id` tells questions apart in
+    /// the cache. Cached and repeated texts cost nothing; the rest share forward passes, batched with texts of similar length.
+    pub fn probs(&mut self, id: usize, q: &Question, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let keys: Vec<String> = texts.iter().map(|t| if self.fuzzy { template(t) } else { t.to_string() }).collect();
+        let [cls, sep, ..] = self.special;
+        let mut todo = vec![]; // (key, ids, markers) for each text the cache does not know
+        let mut seen = HashSet::new();
+        for (key, text) in keys.iter().zip(texts) {
+            if !self.cache.contains_key(&(id, key.clone())) && seen.insert(key) {
+                let (ids, markers) = build_sequence(q, &self.enc(text)?, cls, sep, self.max_len, self.head_max_len);
+                todo.push((key, ids, markers));
+            }
         }
-        let [cls, sep, _] = self.special;
-        let (ids, markers) = build_sequence(q, &self.enc(text)?, cls, sep, self.max_len, self.head_max_len);
-        let (len, k) = (ids.len(), markers.len());
-        let outputs = self.session.run(ort::inputs! {
-            "input_ids" => Tensor::from_array(([1, len], ids.iter().map(|&t| t as i64).collect::<Vec<_>>()))?,
-            "attention_mask" => Tensor::from_array(([1, len], vec![1i64; len]))?,
-            "marker_pos" => Tensor::from_array(([1, k], markers.iter().map(|&m| m as i64).collect::<Vec<_>>()))?,
-            "marker_mask" => Tensor::from_array(([1, k], vec![true; k]))?,
-            "qtype" => Tensor::from_array(([1], vec![q.qtype]))?,
-        })?;
-        self.calls += 1;
-        let t = self.variant.temperature(q.qtype, k);
-        let logits: Vec<f32> = outputs["logits"].try_extract_tensor::<f32>()?.1[..k].iter().map(|z| z / t).collect();
-        let p = softmax(&logits);
-        if self.cache.len() >= CACHE_MAX {
+        todo.sort_by_key(|t| t.1.len()); // little padding per batch
+        let mut fresh = HashMap::new();
+        let mut rest = &todo[..];
+        while !rest.is_empty() {
+            let mut n = 1; // sorted, so the last one in a batch is the longest
+            while n < rest.len().min(self.batch) && (n + 1) * rest[n].1.len() <= BATCH_TOKENS {
+                n += 1;
+            }
+            let (batch, tail) = rest.split_at(n);
+            let seqs: Vec<_> = batch.iter().map(|t| (&t.1[..], &t.2[..])).collect();
+            for (t, p) in batch.iter().zip(self.forward(q, &seqs)?) {
+                fresh.insert(t.0.clone(), p);
+            }
+            rest = tail;
+        }
+        let out = keys.iter().map(|k| fresh.get(k).or_else(|| self.cache.get(&(id, k.clone()))).cloned().context("lost an answer")).collect();
+        if self.cache.len() + fresh.len() > CACHE_MAX {
             self.cache.clear();
         }
-        self.cache.insert(key, p.clone());
-        Ok(p)
+        self.cache.extend(fresh.into_iter().map(|(k, p)| ((id, k), p)));
+        out
+    }
+
+    /// One forward pass over sequences of the same question, right-padded to the longest.
+    fn forward(&mut self, q: &Question, seqs: &[(&[u32], &[usize])]) -> Result<Vec<Vec<f32>>> {
+        let n = seqs.len();
+        let len = seqs.iter().map(|s| s.0.len()).max().unwrap_or(0);
+        let k = seqs.iter().map(|s| s.1.len()).max().unwrap_or(0);
+        let pad = self.special[3] as i64;
+        let (mut ids, mut mask, mut pos, mut on) = (Vec::with_capacity(n * len), Vec::with_capacity(n * len), Vec::with_capacity(n * k), Vec::with_capacity(n * k));
+        for (s, m) in seqs {
+            ids.extend(s.iter().map(|&t| t as i64).chain(std::iter::repeat(pad)).take(len));
+            mask.extend((0..len).map(|i| (i < s.len()) as i64));
+            pos.extend(m.iter().map(|&x| x as i64).chain(std::iter::repeat(0)).take(k));
+            on.extend((0..k).map(|i| i < m.len()));
+        }
+        let outputs = self.session.run(ort::inputs! {
+            "input_ids" => Tensor::from_array(([n, len], ids))?,
+            "attention_mask" => Tensor::from_array(([n, len], mask))?,
+            "marker_pos" => Tensor::from_array(([n, k], pos))?,
+            "marker_mask" => Tensor::from_array(([n, k], on))?,
+            "qtype" => Tensor::from_array(([n], vec![q.qtype; n]))?,
+        })?;
+        self.calls += n;
+        let (shape, logits) = outputs["logits"].try_extract_tensor::<f32>()?;
+        let width = shape.get(1).map_or(k, |&w| w as usize);
+        Ok(seqs.iter().enumerate().map(|(r, (_, m))| {
+            let t = self.variant.temperature(q.qtype, m.len());
+            softmax(&logits[r * width..r * width + m.len()].iter().map(|z| z / t).collect::<Vec<_>>())
+        }).collect())
     }
 }
 
